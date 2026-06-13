@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.txt.bak
+english_all.txt
+spanish_all.txt
+flags_all.txt
