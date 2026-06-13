@@ -11,6 +11,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 try:
@@ -22,12 +23,15 @@ import anthropic
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = SCRIPT_DIR / "wikowi_codex_prompt_FINAL.md"
-MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4000
 INPUT_COST_PER_M = 5.0
 OUTPUT_COST_PER_M = 25.0
+BATCH_DISCOUNT = 0.5
 PREVIEW_COUNT = 3
 API_MAX_RETRIES = 4
+BATCH_POLL_SEC = 15
+BATCH_MAX_REQUESTS = 5000
 TEXT_SUFFIXES = {".txt", ".text", ".md"}
 ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
@@ -91,6 +95,10 @@ def resolve_api_key() -> str:
         "No API key found. Set ANTHROPIC_API_KEY or save a key in PDF Transcribe "
         "(same as the transcriber app)."
     )
+
+
+def resolve_model() -> str:
+    return (os.environ.get("CLAUDE_MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
 def load_system_prompt() -> str:
@@ -181,12 +189,23 @@ def build_user_message(nahuatl: str, english: str) -> str:
     )
 
 
-def message_text(message: anthropic.types.Message) -> str:
+def message_text(message: anthropic.types.Message | dict) -> str:
     parts: list[str] = []
-    for block in message.content:
-        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+    content = message.content if hasattr(message, "content") else message.get("content", [])
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") == "text" and block.get("text"):
+                parts.append(block["text"])
+        elif getattr(block, "type", None) == "text" and getattr(block, "text", None):
             parts.append(block.text)
     return "\n".join(parts)
+
+
+def message_usage(message: anthropic.types.Message | dict) -> tuple[int, int]:
+    usage = message.usage if hasattr(message, "usage") else message.get("usage", {})
+    if isinstance(usage, dict):
+        return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+    return int(getattr(usage, "input_tokens", 0)), int(getattr(usage, "output_tokens", 0))
 
 
 def parse_response(text: str) -> dict[str, str | None]:
@@ -197,10 +216,142 @@ def parse_response(text: str) -> dict[str, str | None]:
     return out
 
 
-def token_cost(input_tokens: int, output_tokens: int) -> float:
-    return (input_tokens / 1_000_000 * INPUT_COST_PER_M) + (
-        output_tokens / 1_000_000 * OUTPUT_COST_PER_M
+def token_cost(input_tokens: int, output_tokens: int, *, batch: bool = False) -> float:
+    factor = BATCH_DISCOUNT if batch else 1.0
+    return (input_tokens / 1_000_000 * INPUT_COST_PER_M * factor) + (
+        output_tokens / 1_000_000 * OUTPUT_COST_PER_M * factor
     )
+
+
+def batch_custom_id(index: int) -> str:
+    return f"passage-{index:05d}"
+
+
+def parse_passage_index(custom_id: str) -> int | None:
+    match = re.fullmatch(r"passage-(\d+)", custom_id or "")
+    return int(match.group(1)) if match else None
+
+
+def build_message_params(system_prompt: str, nahuatl: str, english: str) -> dict:
+    return {
+        "model": resolve_model(),
+        "max_tokens": MAX_TOKENS,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": build_user_message(nahuatl, english)}],
+    }
+
+
+def apply_parsed_response(result: PassageResult, response_text: str) -> None:
+    if not response_text.strip():
+        raise ValueError("Empty API response")
+    parsed = parse_response(response_text)
+    if not parsed.get("english") or not parsed.get("spanish"):
+        raise ValueError("Response missing <english> or <spanish> tags")
+    result.english = parsed["english"] or ""
+    result.spanish = parsed["spanish"] or ""
+    result.flags = parsed.get("flags")
+
+
+def create_translation_batch(
+    client: anthropic.Anthropic,
+    system_prompt: str,
+    pairs: list[tuple[str, str]],
+    start_index: int = 1,
+) -> str:
+    requests = [
+        {
+            "custom_id": batch_custom_id(i),
+            "params": build_message_params(system_prompt, nahuatl, english),
+        }
+        for i, (nahuatl, english) in enumerate(pairs, start=start_index)
+    ]
+    batch = client.messages.batches.create(requests=requests)
+    batch_id = getattr(batch, "id", None) or (batch.get("id") if isinstance(batch, dict) else None)
+    if not batch_id:
+        raise RuntimeError("Batch API did not return a batch id.")
+    return batch_id
+
+
+def wait_for_batch(
+    client: anthropic.Anthropic,
+    batch_id: str,
+    *,
+    on_status: Callable[[object], None] | None = None,
+) -> object:
+    while True:
+        batch = client.messages.batches.retrieve(batch_id)
+        if on_status:
+            on_status(batch)
+        status = getattr(batch, "processing_status", None) or (
+            batch.get("processing_status") if isinstance(batch, dict) else None
+        )
+        if status == "ended":
+            return batch
+        if status in ("canceling", "canceled"):
+            raise RuntimeError(f"Batch {batch_id} was canceled.")
+        time.sleep(BATCH_POLL_SEC)
+
+
+def batch_counts_done(batch: object) -> tuple[int, int]:
+    counts = getattr(batch, "request_counts", None)
+    if counts is None and isinstance(batch, dict):
+        counts = batch.get("request_counts")
+    if counts is None:
+        return 0, 0
+    if isinstance(counts, dict):
+        processing = int(counts.get("processing", 0))
+        done = sum(int(counts.get(k, 0)) for k in ("succeeded", "errored", "canceled", "expired"))
+    else:
+        processing = int(getattr(counts, "processing", 0))
+        done = sum(
+            int(getattr(counts, k, 0))
+            for k in ("succeeded", "errored", "canceled", "expired")
+        )
+    return done, done + processing
+
+
+def collect_batch_results(
+    client: anthropic.Anthropic,
+    batch_id: str,
+) -> dict[int, PassageResult]:
+    by_index: dict[int, PassageResult] = {}
+    for entry in client.messages.batches.results(batch_id):
+        custom_id = getattr(entry, "custom_id", None) or (
+            entry.get("custom_id") if isinstance(entry, dict) else ""
+        )
+        index = parse_passage_index(custom_id or "")
+        if index is None:
+            continue
+        result = PassageResult(index=index)
+        raw_result = getattr(entry, "result", None) or (
+            entry.get("result") if isinstance(entry, dict) else None
+        )
+        if raw_result is None:
+            result.error = "Missing batch result payload"
+            by_index[index] = result
+            continue
+        rtype = getattr(raw_result, "type", None) or (
+            raw_result.get("type") if isinstance(raw_result, dict) else None
+        )
+        if rtype == "succeeded":
+            message = getattr(raw_result, "message", None) or raw_result.get("message")
+            try:
+                apply_parsed_response(result, message_text(message))
+                in_tok, out_tok = message_usage(message)
+                result.input_tokens = in_tok
+                result.output_tokens = out_tok
+            except Exception as exc:
+                result.error = str(exc)
+        elif rtype == "errored":
+            err = getattr(raw_result, "error", None) or raw_result.get("error", {})
+            if isinstance(err, dict):
+                result.error = err.get("message") or json.dumps(err)[:500]
+            else:
+                result.error = str(err)[:500]
+        else:
+            result.error = f"Unexpected batch result type: {rtype}"
+        by_index[index] = result
+    return by_index
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
@@ -220,7 +371,7 @@ def call_claude(client: anthropic.Anthropic, system_prompt: str, user_message: s
     for attempt in range(API_MAX_RETRIES):
         try:
             return client.messages.create(
-                model=MODEL,
+                model=resolve_model(),
                 max_tokens=MAX_TOKENS,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
@@ -244,6 +395,56 @@ def format_file_list(paths: list[Path], max_names: int = 2) -> str:
     return f"{shown} (+{len(names) - max_names} more)"
 
 
+def write_run_summary(
+    out_dir: Path,
+    *,
+    mode: str,
+    results: list[PassageResult],
+    failed: list[int],
+    nahuatl_paths: list[Path],
+    english_paths: list[Path],
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+    batch_ids: list[str] | None = None,
+) -> None:
+    model = resolve_model()
+    stats = {
+        "model": model,
+        "mode": mode,
+        "passages_total": len(results),
+        "passages_succeeded": len(results) - len(failed),
+        "passages_failed": len(failed),
+        "failed_passage_numbers": failed,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "estimated_cost_usd": round(cost, 4),
+        "batch_discount_applied": mode == "batch",
+        "batch_ids": batch_ids or [],
+        "nahuatl_files": [str(p) for p in nahuatl_paths],
+        "english_files": [str(p) for p in english_paths],
+        "outputs": {
+            "english": str(out_dir / "english_all.txt"),
+            "spanish": str(out_dir / "spanish_all.txt"),
+            "flags": str(out_dir / "flags_all.txt") if any(r.flags for r in results if not r.error) else None,
+        },
+    }
+    (out_dir / "run_summary.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    lines = [
+        "Nahuatl Codex Translator — run summary",
+        f"Model: {model}",
+        f"Mode: {'Batch (~50% off)' if mode == 'batch' else 'Live (full price)'}",
+        f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} succeeded",
+        f"Tokens: {input_tokens} in / {output_tokens} out",
+        f"Estimated cost: ${cost:.4f}",
+    ]
+    if batch_ids:
+        lines.append(f"Batch IDs: {', '.join(batch_ids)}")
+    if failed:
+        lines.append(f"Failed passages: {failed}")
+    (out_dir / "run_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 @dataclass
 class PassageResult:
     index: int
@@ -265,6 +466,7 @@ class RunState:
     total_cost: float = 0.0
     results: list[PassageResult] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
+    batch_ids: list[str] = field(default_factory=list)
 
 
 class DropZone(tk.Frame):
@@ -374,12 +576,13 @@ class DropZone(tk.Frame):
 class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
-        self.root.title("Nahuatl Codex Translator")
-        self.root.geometry("820x680")
+        self.root.title(f"Nahuatl Codex Translator — {resolve_model()}")
+        self.root.geometry("820x700")
         self.root.minsize(720, 580)
 
         self.state = RunState()
         self._running = False
+        self._mode_radios: list[ttk.Radiobutton] = []
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -415,6 +618,22 @@ class TranslatorApp:
 
         self.run_btn = ttk.Button(btn_row, text="Run Translation", command=self.run_translation, state=tk.DISABLED)
         self.run_btn.pack(side=tk.LEFT, padx=8)
+
+        self.mode_var = tk.StringVar(value="batch")
+        mode_frame = tk.Frame(btn_row)
+        mode_frame.pack(side=tk.RIGHT)
+        for text, value in (("Batch (50% off)", "batch"), ("Live (immediate)", "live")):
+            rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode_var, value=value)
+            rb.pack(side=tk.LEFT, padx=4)
+            self._mode_radios.append(rb)
+
+        model_label = tk.Label(
+            self.root,
+            text=f"Model: {resolve_model()}  ·  max {MAX_TOKENS} tokens/passage",
+            font=("Segoe UI", 9),
+            fg="#666",
+        )
+        model_label.pack(anchor=tk.W, padx=12, pady=(0, 2))
 
         preview_frame = ttk.LabelFrame(self.root, text="Preview (first 3 pairs)")
         preview_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -536,22 +755,51 @@ class TranslatorApp:
             messagebox.showerror("Setup error", str(exc))
             return
 
-        self._running = True
-        self.preview_btn.configure(state=tk.DISABLED)
-        self.run_btn.configure(state=tk.DISABLED)
-        self.nahuatl_zone.configure(cursor="watch")
-        self.english_zone.configure(cursor="watch")
+        self._set_running_ui(True)
         self.state.total_input_tokens = 0
         self.state.total_output_tokens = 0
         self.state.total_cost = 0.0
         self.state.results = []
         self.state.failed = []
+        self.state.batch_ids = []
         self.progress.configure(maximum=len(self.state.pairs), value=0)
 
-        thread = threading.Thread(target=self._translate_worker, daemon=True)
+        thread = threading.Thread(
+            target=self._translate_worker_batch if self.mode_var.get() == "batch" else self._translate_worker_live,
+            daemon=True,
+        )
         thread.start()
 
-    def _translate_worker(self):
+    def _set_running_ui(self, running: bool) -> None:
+        self._running = running
+        state = tk.DISABLED if running else tk.NORMAL
+        self.preview_btn.configure(state=state)
+        self.run_btn.configure(state=tk.DISABLED if running else (tk.NORMAL if self.state.pairs else tk.DISABLED))
+        for rb in self._mode_radios:
+            rb.configure(state=state)
+        cursor = "watch" if running else ""
+        self.nahuatl_zone.configure(cursor=cursor)
+        self.english_zone.configure(cursor=cursor)
+
+    def _finalize_passage_result(
+        self,
+        result: PassageResult,
+        *,
+        batch: bool,
+    ) -> None:
+        if result.error:
+            return
+        self.state.total_input_tokens += result.input_tokens
+        self.state.total_output_tokens += result.output_tokens
+        passage_cost = token_cost(result.input_tokens, result.output_tokens, batch=batch)
+        self.state.total_cost += passage_cost
+        print(
+            f"Passage {result.index}: in={result.input_tokens} out={result.output_tokens} "
+            f"cost=${passage_cost:.4f} running_total=${self.state.total_cost:.4f}"
+            + (" (batch rate)" if batch else "")
+        )
+
+    def _translate_worker_live(self):
         try:
             api_key = resolve_api_key()
             system_prompt = load_system_prompt()
@@ -572,28 +820,10 @@ class TranslatorApp:
                     build_user_message(nahuatl, english),
                 )
                 response_text = message_text(message)
-                if not response_text.strip():
-                    raise ValueError("Empty API response")
-
-                parsed = parse_response(response_text)
-                if not parsed.get("english") or not parsed.get("spanish"):
-                    raise ValueError("Response missing <english> or <spanish> tags")
-
-                result.english = parsed["english"] or ""
-                result.spanish = parsed["spanish"] or ""
-                result.flags = parsed.get("flags")
+                apply_parsed_response(result, response_text)
                 result.input_tokens = message.usage.input_tokens
                 result.output_tokens = message.usage.output_tokens
-
-                self.state.total_input_tokens += result.input_tokens
-                self.state.total_output_tokens += result.output_tokens
-                passage_cost = token_cost(result.input_tokens, result.output_tokens)
-                self.state.total_cost += passage_cost
-
-                print(
-                    f"Passage {i}: in={result.input_tokens} out={result.output_tokens} "
-                    f"cost=${passage_cost:.4f} running_total=${self.state.total_cost:.4f}"
-                )
+                self._finalize_passage_result(result, batch=False)
             except Exception as exc:
                 result.error = str(exc)
                 failed.append(i)
@@ -601,30 +831,111 @@ class TranslatorApp:
 
             results.append(result)
             done = i
-            self.root.after(0, lambda d=done, r=result: self._update_progress(d, r))
+            self.root.after(0, lambda d=done, r=result: self._update_progress(d, r, batch=False))
 
-        self.root.after(0, lambda: self._on_run_complete(results, failed))
+        self.root.after(0, lambda: self._on_run_complete(results, failed, batch=False))
 
-    def _update_progress(self, done: int, result: PassageResult):
+    def _translate_worker_batch(self):
+        try:
+            api_key = resolve_api_key()
+            system_prompt = load_system_prompt()
+            client = anthropic.Anthropic(api_key=api_key)
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_run_error(str(exc)))
+            return
+
+        pairs = self.state.pairs
+        total = len(pairs)
+        results_by_index: dict[int, PassageResult] = {
+            i: PassageResult(index=i) for i in range(1, total + 1)
+        }
+        failed: list[int] = []
+        batch_ids: list[str] = []
+
+        try:
+            chunks: list[tuple[int, list[tuple[str, str]]]] = []
+            for offset in range(0, total, BATCH_MAX_REQUESTS):
+                start = offset + 1
+                chunk_pairs = pairs[offset : offset + BATCH_MAX_REQUESTS]
+                chunks.append((start, chunk_pairs))
+
+            for chunk_num, (start_index, chunk_pairs) in enumerate(chunks, start=1):
+                label = (
+                    f"Submitting batch {chunk_num}/{len(chunks)} "
+                    f"({len(chunk_pairs)} passages)…"
+                )
+                self.root.after(0, lambda msg=label: self.status_var.set(msg))
+
+                batch_id = create_translation_batch(
+                    client, system_prompt, chunk_pairs, start_index=start_index
+                )
+                batch_ids.append(batch_id)
+                self.state.batch_ids = list(batch_ids)
+                out_dir = output_directory(self.state.nahuatl_paths)
+                (out_dir / "batch_state.json").write_text(
+                    json.dumps({"batch_ids": batch_ids, "model": resolve_model()}, indent=2),
+                    encoding="utf-8",
+                )
+                print(f"Batch submitted: {batch_id} ({len(chunk_pairs)} passages)")
+
+                def on_batch_status(batch_info: object, c=chunk_num, tc=len(chunks)):
+                    done, batch_total = batch_counts_done(batch_info)
+                    if batch_total:
+                        self.root.after(
+                            0,
+                            lambda d=done, t=batch_total, cn=c, tcn=tc: (
+                                self.progress.configure(value=min(d, total), maximum=total),
+                                self.status_var.set(
+                                    f"Batch {cn}/{tcn} processing… {d}/{t} requests "
+                                    "(~50% off, usually under 1 hour)"
+                                ),
+                            ),
+                        )
+
+                wait_for_batch(client, batch_id, on_status=on_batch_status)
+                chunk_results = collect_batch_results(client, batch_id)
+
+                for idx in range(start_index, start_index + len(chunk_pairs)):
+                    result = chunk_results.get(idx) or PassageResult(
+                        index=idx, error="No result returned for this passage"
+                    )
+                    results_by_index[idx] = result
+                    if result.error:
+                        failed.append(idx)
+                        print(f"Passage {idx} FAILED: {result.error}")
+                    else:
+                        self._finalize_passage_result(result, batch=True)
+                    done = idx
+                    self.root.after(
+                        0,
+                        lambda d=done, r=result: self._update_progress(d, r, batch=True),
+                    )
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_run_error(str(exc)))
+            return
+
+        results = [results_by_index[i] for i in range(1, total + 1)]
+        self.root.after(
+            0, lambda: self._on_run_complete(results, sorted(set(failed)), batch=True)
+        )
+
+    def _update_progress(self, done: int, result: PassageResult, *, batch: bool):
         self.progress.configure(value=done)
         if result.error:
             detail = f"Passage {result.index} failed"
         else:
             detail = f"Passage {result.index}: {result.input_tokens}+{result.output_tokens} tok"
+        mode = "batch ~50% off" if batch else "live"
         self.status_var.set(
-            f"{done}/{len(self.state.pairs)} done — ${self.state.total_cost:.4f} est. — {detail}"
+            f"{done}/{len(self.state.pairs)} done — ${self.state.total_cost:.4f} est. ({mode}) — {detail}"
         )
 
     def _on_run_error(self, msg: str):
-        self._running = False
-        self.preview_btn.configure(state=tk.NORMAL)
-        self.run_btn.configure(state=tk.NORMAL)
-        self.nahuatl_zone.configure(cursor="")
-        self.english_zone.configure(cursor="")
+        self._set_running_ui(False)
         messagebox.showerror("Translation error", msg)
 
-    def _on_run_complete(self, results: list[PassageResult], failed: list[int]):
-        self._running = False
+    def _on_run_complete(self, results: list[PassageResult], failed: list[int], *, batch: bool):
+        self._set_running_ui(False)
         self.state.results = results
         self.state.failed = failed
 
@@ -659,24 +970,35 @@ class TranslatorApp:
                 fail_log = out_dir / "failed_passages.log"
                 fail_lines = [f"Passage {i}: {results[i - 1].error}" for i in failed]
                 fail_log.write_text("\n".join(fail_lines) + "\n", encoding="utf-8")
+            write_run_summary(
+                out_dir,
+                mode="batch" if batch else "live",
+                results=results,
+                failed=failed,
+                nahuatl_paths=self.state.nahuatl_paths,
+                english_paths=self.state.english_paths,
+                input_tokens=self.state.total_input_tokens,
+                output_tokens=self.state.total_output_tokens,
+                cost=self.state.total_cost,
+                batch_ids=self.state.batch_ids if batch else None,
+            )
+            batch_state = out_dir / "batch_state.json"
+            if batch_state.is_file() and not failed:
+                batch_state.unlink()
         except OSError as exc:
             messagebox.showerror("Save error", str(exc))
-            self.preview_btn.configure(state=tk.NORMAL)
-            self.run_btn.configure(state=tk.NORMAL)
-            self.nahuatl_zone.configure(cursor="")
-            self.english_zone.configure(cursor="")
+            self._set_running_ui(False)
             return
 
-        self.preview_btn.configure(state=tk.NORMAL)
-        self.run_btn.configure(state=tk.NORMAL)
-        self.nahuatl_zone.configure(cursor="")
-        self.english_zone.configure(cursor="")
-
+        rate_note = " (batch rate, ~50% off)" if batch else ""
         summary = (
             f"Done — {len(results) - len(failed)}/{len(results)} succeeded.\n"
+            f"Model: {resolve_model()}\n"
+            f"Mode: {'Batch (~50% off)' if batch else 'Live (full price)'}\n"
             f"Tokens: {self.state.total_input_tokens} in / {self.state.total_output_tokens} out\n"
-            f"Estimated cost: ${self.state.total_cost:.4f}\n"
-            f"Saved to {out_dir}"
+            f"Estimated cost: ${self.state.total_cost:.4f}{rate_note}\n"
+            f"Saved to {out_dir}\n"
+            f"(run_summary.json + run_summary.txt)"
         )
         if failed:
             summary += f"\n\nFailed passages: {failed}\nSee failed_passages.log in output folder."

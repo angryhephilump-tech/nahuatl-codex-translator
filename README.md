@@ -28,13 +28,22 @@ python nahuatl_translator.py
 2. Drop one or more matching English reference `.txt` files on the right zone.
 3. Multiple files on a side are merged in **alphabetical order** before splitting.
 4. Click **Split & Preview** to verify the first 3 aligned pairs.
-5. Click **Run Translation** to process all passages.
+5. Choose **Batch (50% off)** — default — or **Live (immediate)**.
+6. Click **Run Translation** to process all passages.
 
 Outputs are saved next to the Nahuatl input file:
 
 - `english_all.txt`
 - `spanish_all.txt`
 - `flags_all.txt` (only if any passage returned `<flags>`)
+- `run_summary.json` / `run_summary.txt` — model, mode, tokens, cost, failures
+- `failed_passages.log` — if any passage failed
+- `batch_state.json` — written while a batch is in flight (removed on clean completion)
+
+## Model
+
+Uses **`claude-opus-4-8`** (Claude Opus) for both live and batch modes — same as your PDF transcriber.
+Override with the `CLAUDE_MODEL` environment variable if needed.
 
 ## Splitting
 
@@ -44,6 +53,11 @@ Both files are split on the same logic:
 - Double line breaks if no headings are detected.
 
 Passage *n* in Nahuatl is paired with passage *n* in English.
+
+## API modes
+
+- **Batch (50% off)** — default. Submits all passages via Anthropic Message Batches API (~50% token discount). Results usually arrive within an hour; the app polls until done.
+- **Live (immediate)** — one request per passage at full price, with live progress.
 
 ## System prompt
 
