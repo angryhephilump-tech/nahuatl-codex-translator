@@ -24,10 +24,11 @@ Never commit API keys to git.
 python nahuatl_translator.py
 ```
 
-1. Drop the Nahuatl `.txt` file on the left zone.
-2. Drop the matching English reference `.txt` on the right zone.
-3. Click **Split & Preview** to verify the first 3 aligned pairs.
-4. Click **Run Translation** to process all passages.
+1. Drop one or more Nahuatl `.txt` files on the left zone (or **Browse**).
+2. Drop one or more matching English reference `.txt` files on the right zone.
+3. Multiple files on a side are merged in **alphabetical order** before splitting.
+4. Click **Split & Preview** to verify the first 3 aligned pairs.
+5. Click **Run Translation** to process all passages.
 
 Outputs are saved next to the Nahuatl input file:
 

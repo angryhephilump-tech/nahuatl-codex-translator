@@ -7,10 +7,11 @@ import json
 import os
 import re
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -26,6 +27,9 @@ MAX_TOKENS = 4000
 INPUT_COST_PER_M = 5.0
 OUTPUT_COST_PER_M = 25.0
 PREVIEW_COUNT = 3
+API_MAX_RETRIES = 4
+TEXT_SUFFIXES = {".txt", ".text", ".md"}
+ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
 CHAPTER_HEADING_RE = re.compile(
     r"^(?:"
@@ -95,6 +99,59 @@ def load_system_prompt() -> str:
     return PROMPT_FILE.read_text(encoding="utf-8").strip()
 
 
+def parse_drop_paths(tk_root: tk.Misc, data: str) -> list[Path]:
+    """Parse one or many file paths from a drag-and-drop event (Windows-safe)."""
+    raw = (data or "").strip()
+    if not raw:
+        return []
+    try:
+        items = tk_root.tk.splitlist(raw)
+    except tk.TclError:
+        items = [raw]
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for item in items:
+        p = Path(str(item).strip().strip('"').strip("'"))
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(p)
+    return paths
+
+
+def read_text_file(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {path}")
+    last_err: Exception | None = None
+    for enc in ENCODINGS:
+        try:
+            return path.read_text(encoding=enc)
+        except (UnicodeDecodeError, OSError) as exc:
+            last_err = exc
+    raise OSError(f"Could not read {path.name}: {last_err}")
+
+
+def read_text_files(paths: list[Path]) -> str:
+    """Read multiple files in sorted name order, joined with a blank line."""
+    ordered = sorted(paths, key=lambda p: p.name.lower())
+    parts: list[str] = []
+    for path in ordered:
+        text = read_text_file(path).strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def output_directory(paths: list[Path]) -> Path:
+    if not paths:
+        return SCRIPT_DIR
+    parents = {p.resolve().parent for p in paths if p.exists()}
+    if len(parents) == 1:
+        return next(iter(parents))
+    return sorted(paths, key=lambda p: p.name.lower())[0].resolve().parent
+
+
 def split_passages(text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -124,6 +181,14 @@ def build_user_message(nahuatl: str, english: str) -> str:
     )
 
 
+def message_text(message: anthropic.types.Message) -> str:
+    parts: list[str] = []
+    for block in message.content:
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+            parts.append(block.text)
+    return "\n".join(parts)
+
+
 def parse_response(text: str) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
     for tag, pattern in TAG_RE.items():
@@ -136,6 +201,47 @@ def token_cost(input_tokens: int, output_tokens: int) -> float:
     return (input_tokens / 1_000_000 * INPUT_COST_PER_M) + (
         output_tokens / 1_000_000 * OUTPUT_COST_PER_M
     )
+
+
+def is_retryable_api_error(exc: Exception) -> bool:
+    if isinstance(exc, anthropic.RateLimitError):
+        return True
+    if isinstance(exc, anthropic.APIConnectionError):
+        return True
+    if isinstance(exc, anthropic.InternalServerError):
+        return True
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code >= 500:
+        return True
+    return False
+
+
+def call_claude(client: anthropic.Anthropic, system_prompt: str, user_message: str) -> anthropic.types.Message:
+    last_err: Exception | None = None
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            return client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except Exception as exc:
+            last_err = exc
+            if attempt < API_MAX_RETRIES - 1 and is_retryable_api_error(exc):
+                time.sleep(min(2**attempt, 30))
+                continue
+            raise
+    raise last_err or RuntimeError("API call failed")
+
+
+def format_file_list(paths: list[Path], max_names: int = 2) -> str:
+    if not paths:
+        return ""
+    names = [p.name for p in sorted(paths, key=lambda p: p.name.lower())]
+    if len(names) <= max_names:
+        return ", ".join(names)
+    shown = ", ".join(names[:max_names])
+    return f"{shown} (+{len(names) - max_names} more)"
 
 
 @dataclass
@@ -152,8 +258,8 @@ class PassageResult:
 @dataclass
 class RunState:
     pairs: list[tuple[str, str]] = field(default_factory=list)
-    nahuatl_path: Path | None = None
-    english_path: Path | None = None
+    nahuatl_paths: list[Path] = field(default_factory=list)
+    english_paths: list[Path] = field(default_factory=list)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_cost: float = 0.0
@@ -162,16 +268,23 @@ class RunState:
 
 
 class DropZone(tk.Frame):
-    def __init__(self, master, label: str, on_file, **kwargs):
+    def __init__(self, master, label: str, on_files, *, allow_multiple: bool = True, **kwargs):
         super().__init__(master, relief=tk.GROOVE, borderwidth=2, **kwargs)
-        self.on_file = on_file
-        self.file_path: Path | None = None
+        self.on_files = on_files
+        self.allow_multiple = allow_multiple
+        self.file_paths: list[Path] = []
+        self._default_bg = self.cget("bg")
 
-        self.label = tk.Label(self, text=label, font=("Segoe UI", 11), wraplength=220)
-        self.label.pack(expand=True, fill=tk.BOTH, padx=12, pady=24)
+        self.label = tk.Label(self, text=label, font=("Segoe UI", 11), wraplength=240)
+        self.label.pack(expand=True, fill=tk.BOTH, padx=12, pady=(20, 8))
 
-        self.path_label = tk.Label(self, text="", font=("Segoe UI", 9), fg="#555", wraplength=220)
-        self.path_label.pack(padx=8, pady=(0, 12))
+        self.path_label = tk.Label(self, text="No files loaded", font=("Segoe UI", 9), fg="#555", wraplength=240)
+        self.path_label.pack(padx=8, pady=(0, 8))
+
+        btn_row = tk.Frame(self)
+        btn_row.pack(pady=(0, 10))
+        ttk.Button(btn_row, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=3)
+        ttk.Button(btn_row, text="Clear", command=self._clear).pack(side=tk.LEFT, padx=3)
 
         self.drop_target_register(DND_FILES)
         self.dnd_bind("<<Drop>>", self._handle_drop)
@@ -187,38 +300,89 @@ class DropZone(tk.Frame):
         self._reset_bg()
 
     def _reset_bg(self):
-        self.configure(bg=self.master.cget("bg"))
-        self.label.configure(bg=self.master.cget("bg"))
-        self.path_label.configure(bg=self.master.cget("bg"))
+        bg = self._default_bg
+        self.configure(bg=bg)
+        self.label.configure(bg=bg)
+        self.path_label.configure(bg=bg)
+
+    def _valid_paths(self, paths: list[Path]) -> list[Path]:
+        good: list[Path] = []
+        bad: list[str] = []
+        for path in paths:
+            if path.suffix.lower() not in TEXT_SUFFIXES:
+                bad.append(path.name)
+                continue
+            if not path.is_file():
+                bad.append(path.name)
+                continue
+            good.append(path)
+        if bad:
+            messagebox.showwarning(
+                "Skipped files",
+                "These were skipped (not readable .txt/.md files):\n" + "\n".join(bad),
+            )
+        return good
 
     def _handle_drop(self, event):
         self._reset_bg()
-        raw = event.data.strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1]
-        path = Path(raw)
-        if path.suffix.lower() not in {".txt", ".text"}:
-            messagebox.showwarning("Invalid file", "Please drop a .txt file.")
+        paths = parse_drop_paths(self.winfo_toplevel(), event.data)
+        paths = self._valid_paths(paths)
+        if not paths:
             return
-        self.set_file(path)
+        if not self.allow_multiple and len(paths) > 1:
+            paths = [paths[0]]
+        self.add_files(paths, replace=not self.allow_multiple)
 
-    def set_file(self, path: Path):
-        self.file_path = path
-        self.path_label.configure(text=path.name)
-        self.on_file(path)
+    def _browse(self):
+        selected = filedialog.askopenfilenames(
+            parent=self.winfo_toplevel(),
+            title="Select text file(s)",
+            filetypes=[("Text files", "*.txt *.text *.md"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        paths = self._valid_paths([Path(p) for p in selected])
+        if paths:
+            self.add_files(paths, replace=False)
+
+    def _clear(self):
+        self.file_paths = []
+        self.path_label.configure(text="No files loaded")
+        self.on_files([])
+
+    def add_files(self, paths: list[Path], *, replace: bool = False):
+        if replace:
+            merged = list(paths)
+        else:
+            merged = list(self.file_paths)
+            for path in paths:
+                resolved = path.resolve()
+                if resolved not in {p.resolve() for p in merged}:
+                    merged.append(path)
+        merged = sorted(merged, key=lambda p: p.name.lower())
+        self.file_paths = merged
+        count = len(merged)
+        if count == 0:
+            self.path_label.configure(text="No files loaded")
+        elif count == 1:
+            self.path_label.configure(text=merged[0].name)
+        else:
+            self.path_label.configure(text=f"{count} files: {format_file_list(merged)}")
+        self.on_files(merged)
 
 
 class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
         self.root.title("Nahuatl Codex Translator")
-        self.root.geometry("780x640")
-        self.root.minsize(680, 560)
+        self.root.geometry("820x680")
+        self.root.minsize(720, 580)
 
         self.state = RunState()
         self._running = False
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
@@ -229,10 +393,18 @@ class TranslatorApp:
         zones = tk.Frame(top)
         zones.pack(fill=tk.X)
 
-        self.nahuatl_zone = DropZone(zones, "Drop Nahuatl file here", self._on_nahuatl)
+        self.nahuatl_zone = DropZone(
+            zones,
+            "Drop Nahuatl file(s) here\n(or Browse — multiple OK)",
+            self._on_nahuatl,
+        )
         self.nahuatl_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(0, 5))
 
-        self.english_zone = DropZone(zones, "Drop English reference file here", self._on_english)
+        self.english_zone = DropZone(
+            zones,
+            "Drop English reference file(s) here\n(or Browse — multiple OK)",
+            self._on_english,
+        )
         self.english_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(5, 0))
 
         btn_row = tk.Frame(self.root)
@@ -259,54 +431,76 @@ class TranslatorApp:
         self.progress = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress.pack(fill=tk.X, pady=4)
 
-        self.status_var = tk.StringVar(value="Drop both files, then Split & Preview.")
-        tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W).pack(fill=tk.X)
+        self.status_var = tk.StringVar(value="Drop file(s) on both sides, then Split & Preview.")
+        tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W, wraplength=780).pack(fill=tk.X)
 
-    def _on_nahuatl(self, path: Path):
-        self.state.nahuatl_path = path
-        self._maybe_enable_run()
+    def _on_nahuatl(self, paths: list[Path]):
+        self.state.nahuatl_paths = paths
+        self.state.pairs = []
+        self.run_btn.configure(state=tk.DISABLED)
+        self._update_ready_status()
 
-    def _on_english(self, path: Path):
-        self.state.english_path = path
-        self._maybe_enable_run()
+    def _on_english(self, paths: list[Path]):
+        self.state.english_paths = paths
+        self.state.pairs = []
+        self.run_btn.configure(state=tk.DISABLED)
+        self._update_ready_status()
 
-    def _maybe_enable_run(self):
-        if self.state.nahuatl_path and self.state.english_path:
-            self.preview_btn.configure(state=tk.NORMAL)
+    def _update_ready_status(self):
+        n = len(self.state.nahuatl_paths)
+        e = len(self.state.english_paths)
+        if n and e:
+            self.status_var.set(
+                f"Ready — {n} Nahuatl + {e} English file(s). Click Split & Preview."
+            )
+        elif n or e:
+            missing = "English" if n else "Nahuatl"
+            self.status_var.set(f"Loaded {max(n, e)} file(s). Still need {missing} file(s).")
         else:
-            self.run_btn.configure(state=tk.DISABLED)
+            self.status_var.set("Drop file(s) on both sides, then Split & Preview.")
 
     def split_and_preview(self):
-        if not self.state.nahuatl_path or not self.state.english_path:
-            messagebox.showinfo("Missing files", "Drop both a Nahuatl and an English file first.")
+        if not self.state.nahuatl_paths or not self.state.english_paths:
+            messagebox.showinfo("Missing files", "Load at least one Nahuatl and one English file.")
             return
 
         try:
-            nahuatl_text = self.state.nahuatl_path.read_text(encoding="utf-8")
-            english_text = self.state.english_path.read_text(encoding="utf-8")
+            nahuatl_text = read_text_files(self.state.nahuatl_paths)
+            english_text = read_text_files(self.state.english_paths)
         except OSError as exc:
             messagebox.showerror("Read error", str(exc))
+            return
+
+        if not nahuatl_text.strip() or not english_text.strip():
+            messagebox.showerror("Empty input", "One or both sides are empty after reading files.")
             return
 
         nahuatl_passages = split_passages(nahuatl_text)
         english_passages = split_passages(english_text)
 
         if not nahuatl_passages or not english_passages:
-            messagebox.showerror("Split error", "One or both files produced no passages.")
+            messagebox.showerror("Split error", "One or both sides produced no passages.")
             return
 
         if len(nahuatl_passages) != len(english_passages):
             messagebox.showwarning(
                 "Count mismatch",
-                f"Nahuatl: {len(nahuatl_passages)} passages\n"
-                f"English: {len(english_passages)} passages\n\n"
+                f"Nahuatl: {len(nahuatl_passages)} passages "
+                f"(from {format_file_list(self.state.nahuatl_paths)})\n"
+                f"English: {len(english_passages)} passages "
+                f"(from {format_file_list(self.state.english_paths)})\n\n"
+                "Files are merged in alphabetical order before splitting.\n"
                 "Check alignment before running. Preview shows the first pairs anyway.",
             )
 
         count = min(len(nahuatl_passages), len(english_passages))
         self.state.pairs = list(zip(nahuatl_passages[:count], english_passages[:count]))
 
-        lines: list[str] = []
+        source_note = (
+            f"Sources: Nahuatl [{format_file_list(self.state.nahuatl_paths)}] | "
+            f"English [{format_file_list(self.state.english_paths)}]\n\n"
+        )
+        lines: list[str] = [source_note]
         for i, (nah, eng) in enumerate(self.state.pairs[:PREVIEW_COUNT], start=1):
             lines.append(f"=== Pair {i} ===")
             lines.append("[NAHUATL]")
@@ -322,7 +516,11 @@ class TranslatorApp:
         self.preview_text.configure(state=tk.DISABLED)
 
         self.run_btn.configure(state=tk.NORMAL if self.state.pairs else tk.DISABLED)
-        self.status_var.set(f"Split into {len(self.state.pairs)} pairs. Review preview, then Run Translation.")
+        self.status_var.set(
+            f"Split into {len(self.state.pairs)} pairs from "
+            f"{len(self.state.nahuatl_paths)} + {len(self.state.english_paths)} file(s). "
+            "Review preview, then Run Translation."
+        )
 
     def run_translation(self):
         if self._running:
@@ -341,6 +539,8 @@ class TranslatorApp:
         self._running = True
         self.preview_btn.configure(state=tk.DISABLED)
         self.run_btn.configure(state=tk.DISABLED)
+        self.nahuatl_zone.configure(cursor="watch")
+        self.english_zone.configure(cursor="watch")
         self.state.total_input_tokens = 0
         self.state.total_output_tokens = 0
         self.state.total_cost = 0.0
@@ -366,15 +566,16 @@ class TranslatorApp:
         for i, (nahuatl, english) in enumerate(self.state.pairs, start=1):
             result = PassageResult(index=i)
             try:
-                message = client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": build_user_message(nahuatl, english)}],
+                message = call_claude(
+                    client,
+                    system_prompt,
+                    build_user_message(nahuatl, english),
                 )
-                response_text = message.content[0].text if message.content else ""
-                parsed = parse_response(response_text)
+                response_text = message_text(message)
+                if not response_text.strip():
+                    raise ValueError("Empty API response")
 
+                parsed = parse_response(response_text)
                 if not parsed.get("english") or not parsed.get("spanish"):
                     raise ValueError("Response missing <english> or <spanish> tags")
 
@@ -418,6 +619,8 @@ class TranslatorApp:
         self._running = False
         self.preview_btn.configure(state=tk.NORMAL)
         self.run_btn.configure(state=tk.NORMAL)
+        self.nahuatl_zone.configure(cursor="")
+        self.english_zone.configure(cursor="")
         messagebox.showerror("Translation error", msg)
 
     def _on_run_complete(self, results: list[PassageResult], failed: list[int]):
@@ -425,7 +628,7 @@ class TranslatorApp:
         self.state.results = results
         self.state.failed = failed
 
-        out_dir = self.state.nahuatl_path.parent if self.state.nahuatl_path else SCRIPT_DIR
+        out_dir = output_directory(self.state.nahuatl_paths)
 
         english_lines: list[str] = []
         spanish_lines: list[str] = []
@@ -452,14 +655,22 @@ class TranslatorApp:
                 (out_dir / "flags_all.txt").write_text(
                     "\n\n".join(flag_blocks) + "\n", encoding="utf-8"
                 )
+            if failed:
+                fail_log = out_dir / "failed_passages.log"
+                fail_lines = [f"Passage {i}: {results[i - 1].error}" for i in failed]
+                fail_log.write_text("\n".join(fail_lines) + "\n", encoding="utf-8")
         except OSError as exc:
             messagebox.showerror("Save error", str(exc))
             self.preview_btn.configure(state=tk.NORMAL)
             self.run_btn.configure(state=tk.NORMAL)
+            self.nahuatl_zone.configure(cursor="")
+            self.english_zone.configure(cursor="")
             return
 
         self.preview_btn.configure(state=tk.NORMAL)
         self.run_btn.configure(state=tk.NORMAL)
+        self.nahuatl_zone.configure(cursor="")
+        self.english_zone.configure(cursor="")
 
         summary = (
             f"Done — {len(results) - len(failed)}/{len(results)} succeeded.\n"
@@ -468,13 +679,22 @@ class TranslatorApp:
             f"Saved to {out_dir}"
         )
         if failed:
-            summary += f"\n\nFailed passages: {failed}"
+            summary += f"\n\nFailed passages: {failed}\nSee failed_passages.log in output folder."
             print(f"Failed passages: {failed}")
 
         self.status_var.set(
             f"Complete — ${self.state.total_cost:.4f} — saved to {out_dir.name}"
         )
         messagebox.showinfo("Translation complete", summary)
+
+    def _on_close(self):
+        if self._running:
+            if not messagebox.askokcancel(
+                "Translation running",
+                "A translation is still in progress. Quit anyway?",
+            ):
+                return
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
