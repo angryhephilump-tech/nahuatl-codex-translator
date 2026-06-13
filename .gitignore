@@ -7,7 +7,14 @@ venv/
 english_all.txt
 spanish_all.txt
 flags_all.txt
+english_all_test.txt
+spanish_all_test.txt
+flags_all_test.txt
 run_summary.json
 run_summary.txt
+run_summary_test.json
+run_summary_test.txt
 batch_state.json
+batch_state_test.json
 failed_passages.log
+failed_passages_test.log

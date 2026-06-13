@@ -29,6 +29,7 @@ INPUT_COST_PER_M = 5.0
 OUTPUT_COST_PER_M = 25.0
 BATCH_DISCOUNT = 0.5
 PREVIEW_COUNT = 3
+TEST_MODE_WORD_LIMIT = 300
 API_MAX_RETRIES = 4
 BATCH_POLL_SEC = 15
 BATCH_MAX_REQUESTS = 5000
@@ -179,6 +180,32 @@ def split_passages(text: str) -> list[str]:
         return chunks
 
     return [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\S+", text))
+
+
+def truncate_words(text: str, max_words: int) -> tuple[str, int, bool]:
+    """Return (text, word_count, was_truncated)."""
+    words = re.findall(r"\S+", text.strip())
+    if len(words) <= max_words:
+        return text.strip(), len(words), False
+    cut = " ".join(words[:max_words])
+    return cut, max_words, True
+
+
+def output_filenames(*, test_mode: bool) -> dict[str, str]:
+    suffix = "_test" if test_mode else ""
+    return {
+        "english": f"english_all{suffix}.txt",
+        "spanish": f"spanish_all{suffix}.txt",
+        "flags": f"flags_all{suffix}.txt",
+        "summary_json": f"run_summary{suffix}.json",
+        "summary_txt": f"run_summary{suffix}.txt",
+        "failed_log": f"failed_passages{suffix}.log",
+        "batch_state": f"batch_state{suffix}.json",
+    }
 
 
 def build_user_message(nahuatl: str, english: str) -> str:
@@ -407,11 +434,16 @@ def write_run_summary(
     output_tokens: int,
     cost: float,
     batch_ids: list[str] | None = None,
+    test_mode: bool = False,
+    test_word_limit: int = TEST_MODE_WORD_LIMIT,
 ) -> None:
     model = resolve_model()
+    names = output_filenames(test_mode=test_mode)
     stats = {
         "model": model,
         "mode": mode,
+        "test_mode": test_mode,
+        "test_word_limit": test_word_limit if test_mode else None,
         "passages_total": len(results),
         "passages_succeeded": len(results) - len(failed),
         "passages_failed": len(failed),
@@ -424,25 +456,29 @@ def write_run_summary(
         "nahuatl_files": [str(p) for p in nahuatl_paths],
         "english_files": [str(p) for p in english_paths],
         "outputs": {
-            "english": str(out_dir / "english_all.txt"),
-            "spanish": str(out_dir / "spanish_all.txt"),
-            "flags": str(out_dir / "flags_all.txt") if any(r.flags for r in results if not r.error) else None,
+            "english": str(out_dir / names["english"]),
+            "spanish": str(out_dir / names["spanish"]),
+            "flags": str(out_dir / names["flags"]) if any(r.flags for r in results if not r.error) else None,
         },
     }
-    (out_dir / "run_summary.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    (out_dir / names["summary_json"]).write_text(json.dumps(stats, indent=2), encoding="utf-8")
     lines = [
         "Nahuatl Codex Translator — run summary",
         f"Model: {model}",
         f"Mode: {'Batch (~50% off)' if mode == 'batch' else 'Live (full price)'}",
+    ]
+    if test_mode:
+        lines.append(f"Test mode: first {test_word_limit} words only")
+    lines.extend([
         f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} succeeded",
         f"Tokens: {input_tokens} in / {output_tokens} out",
         f"Estimated cost: ${cost:.4f}",
-    ]
+    ])
     if batch_ids:
         lines.append(f"Batch IDs: {', '.join(batch_ids)}")
     if failed:
         lines.append(f"Failed passages: {failed}")
-    (out_dir / "run_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (out_dir / names["summary_txt"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -467,6 +503,7 @@ class RunState:
     results: list[PassageResult] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
     batch_ids: list[str] = field(default_factory=list)
+    test_mode: bool = False
 
 
 class DropZone(tk.Frame):
@@ -583,6 +620,7 @@ class TranslatorApp:
         self.state = RunState()
         self._running = False
         self._mode_radios: list[ttk.Radiobutton] = []
+        self._test_mode_cb: ttk.Checkbutton | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -627,6 +665,15 @@ class TranslatorApp:
             rb.pack(side=tk.LEFT, padx=4)
             self._mode_radios.append(rb)
 
+        self.test_mode_var = tk.BooleanVar(value=False)
+        self._test_mode_cb = ttk.Checkbutton(
+            btn_row,
+            text=f"Test mode (first {TEST_MODE_WORD_LIMIT} words)",
+            variable=self.test_mode_var,
+            command=self._on_test_mode_toggle,
+        )
+        self._test_mode_cb.pack(side=tk.LEFT, padx=8)
+
         model_label = tk.Label(
             self.root,
             text=f"Model: {resolve_model()}  ·  max {MAX_TOKENS} tokens/passage",
@@ -652,6 +699,14 @@ class TranslatorApp:
 
         self.status_var = tk.StringVar(value="Drop file(s) on both sides, then Split & Preview.")
         tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W, wraplength=780).pack(fill=tk.X)
+
+    def _on_test_mode_toggle(self):
+        self.state.pairs = []
+        self.run_btn.configure(state=tk.DISABLED)
+        if self.state.nahuatl_paths and self.state.english_paths:
+            self.status_var.set(
+                f"Test mode {'on' if self.test_mode_var.get() else 'off'} — click Split & Preview again."
+            )
 
     def _on_nahuatl(self, paths: list[Path]):
         self.state.nahuatl_paths = paths
@@ -694,6 +749,18 @@ class TranslatorApp:
             messagebox.showerror("Empty input", "One or both sides are empty after reading files.")
             return
 
+        test_mode = self.test_mode_var.get()
+        self.state.test_mode = test_mode
+        trunc_note = ""
+        if test_mode:
+            nahuatl_text, nah_words, nah_cut = truncate_words(nahuatl_text, TEST_MODE_WORD_LIMIT)
+            english_text, eng_words, eng_cut = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
+            trunc_note = (
+                f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words "
+                f"(Nahuatl: {nah_words}{', truncated' if nah_cut else ''}; "
+                f"English: {eng_words}{', truncated' if eng_cut else ''})\n\n"
+            )
+
         nahuatl_passages = split_passages(nahuatl_text)
         english_passages = split_passages(english_text)
 
@@ -715,7 +782,7 @@ class TranslatorApp:
         count = min(len(nahuatl_passages), len(english_passages))
         self.state.pairs = list(zip(nahuatl_passages[:count], english_passages[:count]))
 
-        source_note = (
+        source_note = trunc_note + (
             f"Sources: Nahuatl [{format_file_list(self.state.nahuatl_paths)}] | "
             f"English [{format_file_list(self.state.english_paths)}]\n\n"
         )
@@ -735,8 +802,9 @@ class TranslatorApp:
         self.preview_text.configure(state=tk.DISABLED)
 
         self.run_btn.configure(state=tk.NORMAL if self.state.pairs else tk.DISABLED)
+        test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if test_mode else ""
         self.status_var.set(
-            f"Split into {len(self.state.pairs)} pairs from "
+            f"Split into {len(self.state.pairs)} pairs{test_label} from "
             f"{len(self.state.nahuatl_paths)} + {len(self.state.english_paths)} file(s). "
             "Review preview, then Run Translation."
         )
@@ -777,6 +845,8 @@ class TranslatorApp:
         self.run_btn.configure(state=tk.DISABLED if running else (tk.NORMAL if self.state.pairs else tk.DISABLED))
         for rb in self._mode_radios:
             rb.configure(state=state)
+        if self._test_mode_cb is not None:
+            self._test_mode_cb.configure(state=state)
         cursor = "watch" if running else ""
         self.nahuatl_zone.configure(cursor=cursor)
         self.english_zone.configure(cursor=cursor)
@@ -872,7 +942,8 @@ class TranslatorApp:
                 batch_ids.append(batch_id)
                 self.state.batch_ids = list(batch_ids)
                 out_dir = output_directory(self.state.nahuatl_paths)
-                (out_dir / "batch_state.json").write_text(
+                names = output_filenames(test_mode=self.state.test_mode)
+                (out_dir / names["batch_state"]).write_text(
                     json.dumps({"batch_ids": batch_ids, "model": resolve_model()}, indent=2),
                     encoding="utf-8",
                 )
@@ -940,6 +1011,7 @@ class TranslatorApp:
         self.state.failed = failed
 
         out_dir = output_directory(self.state.nahuatl_paths)
+        names = output_filenames(test_mode=self.state.test_mode)
 
         english_lines: list[str] = []
         spanish_lines: list[str] = []
@@ -956,18 +1028,18 @@ class TranslatorApp:
                     flag_blocks.append(f"=== Passage {r.index} ===\n{r.flags}")
 
         try:
-            (out_dir / "english_all.txt").write_text(
+            (out_dir / names["english"]).write_text(
                 "\n\n".join(english_lines) + "\n", encoding="utf-8"
             )
-            (out_dir / "spanish_all.txt").write_text(
+            (out_dir / names["spanish"]).write_text(
                 "\n\n".join(spanish_lines) + "\n", encoding="utf-8"
             )
             if flag_blocks:
-                (out_dir / "flags_all.txt").write_text(
+                (out_dir / names["flags"]).write_text(
                     "\n\n".join(flag_blocks) + "\n", encoding="utf-8"
                 )
             if failed:
-                fail_log = out_dir / "failed_passages.log"
+                fail_log = out_dir / names["failed_log"]
                 fail_lines = [f"Passage {i}: {results[i - 1].error}" for i in failed]
                 fail_log.write_text("\n".join(fail_lines) + "\n", encoding="utf-8")
             write_run_summary(
@@ -981,8 +1053,9 @@ class TranslatorApp:
                 output_tokens=self.state.total_output_tokens,
                 cost=self.state.total_cost,
                 batch_ids=self.state.batch_ids if batch else None,
+                test_mode=self.state.test_mode,
             )
-            batch_state = out_dir / "batch_state.json"
+            batch_state = out_dir / names["batch_state"]
             if batch_state.is_file() and not failed:
                 batch_state.unlink()
         except OSError as exc:
@@ -991,10 +1064,11 @@ class TranslatorApp:
             return
 
         rate_note = " (batch rate, ~50% off)" if batch else ""
+        test_note = f"\nTest mode: first {TEST_MODE_WORD_LIMIT} words" if self.state.test_mode else ""
         summary = (
             f"Done — {len(results) - len(failed)}/{len(results)} succeeded.\n"
             f"Model: {resolve_model()}\n"
-            f"Mode: {'Batch (~50% off)' if batch else 'Live (full price)'}\n"
+            f"Mode: {'Batch (~50% off)' if batch else 'Live (full price)'}{test_note}\n"
             f"Tokens: {self.state.total_input_tokens} in / {self.state.total_output_tokens} out\n"
             f"Estimated cost: ${self.state.total_cost:.4f}{rate_note}\n"
             f"Saved to {out_dir}\n"

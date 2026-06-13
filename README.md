@@ -28,8 +28,9 @@ python nahuatl_translator.py
 2. Drop one or more matching English reference `.txt` files on the right zone.
 3. Multiple files on a side are merged in **alphabetical order** before splitting.
 4. Click **Split & Preview** to verify the first 3 aligned pairs.
-5. Choose **Batch (50% off)** — default — or **Live (immediate)**.
-6. Click **Run Translation** to process all passages.
+5. Optionally enable **Test mode** to translate only the first ~300 words (cheap sanity check).
+6. Choose **Batch (50% off)** — default — or **Live (immediate)**.
+7. Click **Run Translation** to process all passages.
 
 Outputs are saved next to the Nahuatl input file:
 
@@ -58,6 +59,10 @@ Passage *n* in Nahuatl is paired with passage *n* in English.
 
 - **Batch (50% off)** — default. Submits all passages via Anthropic Message Batches API (~50% token discount). Results usually arrive within an hour; the app polls until done.
 - **Live (immediate)** — one request per passage at full price, with live progress.
+
+## Test mode
+
+Check **Test mode (first 300 words)** before Split & Preview. Both sides are truncated to the first 300 words, then split and translated. Outputs use a `_test` suffix (`english_all_test.txt`, etc.) so they won't overwrite a full run.
 
 ## System prompt
 
