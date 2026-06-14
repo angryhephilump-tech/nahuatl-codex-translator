@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ TRANSLATION_MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4000
 ALIGNMENT_MAX_TOKENS = 2000
 ALIGNMENT_WINDOW_WORDS = 2500
+UNCERTAIN_CURSOR_SKIP_WORDS = 150
 HAIKU_INPUT_COST_PER_M = 1.0
 HAIKU_OUTPUT_COST_PER_M = 5.0
 INPUT_COST_PER_M = 5.0
@@ -87,6 +89,7 @@ class PassageResult:
     truncated: bool = False
     skipped: bool = False
     uncertain_match: bool = False
+    pair_fingerprint: str = ""
 
 
 @dataclass
@@ -154,7 +157,7 @@ def _read_transcriber_key() -> str:
     except (json.JSONDecodeError, OSError):
         return ""
     return (
-        data.get("api_key") or data.get("anthropic_api_key") or data.get("deepseek_api_key") or ""
+        data.get("api_key") or data.get("anthropic_api_key") or ""
     ).strip()
 
 
@@ -184,6 +187,22 @@ def load_system_prompt() -> str:
     if not PROMPT_FILE.is_file():
         raise FileNotFoundError(f"System prompt not found: {PROMPT_FILE}")
     return PROMPT_FILE.read_text(encoding="utf-8")
+
+
+def source_content_hash(nahuatl_text: str, english_text: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(nahuatl_text.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(english_text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def pair_fingerprint(nahuatl: str, english: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(nahuatl.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(english.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def save_system_prompt(text: str) -> None:
@@ -449,15 +468,20 @@ def load_passage_record(path: Path) -> PassageResult | None:
             truncated=bool(data.get("truncated", False)),
             skipped=bool(data.get("skipped", False)),
             uncertain_match=bool(data.get("uncertain_match", False)),
+            pair_fingerprint=data.get("pair_fingerprint", ""),
         )
     except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
         return None
 
 
-def passage_is_resumable(result: PassageResult | None) -> bool:
+def passage_is_resumable(result: PassageResult | None, expected_fingerprint: str) -> bool:
     if result is None or result.error or result.truncated:
         return False
-    return bool(result.english.strip() and result.spanish.strip())
+    if not result.english.strip() or not result.spanish.strip():
+        return False
+    if not result.pair_fingerprint or result.pair_fingerprint != expected_fingerprint:
+        return False
+    return True
 
 
 def save_passage_record(out_dir: Path, result: PassageResult, test_mode: bool) -> None:
@@ -575,8 +599,7 @@ def split_settings_fingerprint(
 def load_alignment_map(
     path: Path,
     *,
-    nahuatl_paths: list[Path],
-    english_paths: list[Path],
+    content_hash: str,
     settings: dict,
 ) -> list[AlignmentEntry] | None:
     if not path.is_file():
@@ -587,9 +610,7 @@ def load_alignment_map(
         return None
     if data.get("settings") != settings:
         return None
-    if data.get("nahuatl_files") != [str(p) for p in nahuatl_paths]:
-        return None
-    if data.get("english_files") != [str(p) for p in english_paths]:
+    if data.get("content_hash") != content_hash:
         return None
     entries: list[AlignmentEntry] = []
     for item in data.get("pairs", []):
@@ -608,14 +629,12 @@ def save_alignment_map(
     path: Path,
     entries: list[AlignmentEntry],
     *,
-    nahuatl_paths: list[Path],
-    english_paths: list[Path],
+    content_hash: str,
     settings: dict,
 ) -> None:
     payload = {
         "settings": settings,
-        "nahuatl_files": [str(p) for p in nahuatl_paths],
-        "english_files": [str(p) for p in english_paths],
+        "content_hash": content_hash,
         "pairs": [asdict(e) for e in entries],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -649,13 +668,99 @@ def normalize_alignment_response(text: str) -> str:
     return cleaned
 
 
-def verify_english_substring(match: str, english_text: str, cursor: int) -> bool:
+def normalize_for_match(text: str) -> str:
+    quote_map = str.maketrans(
+        {
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u00ab": '"',
+            "\u00bb": '"',
+            "\u2014": "-",
+            "\u2013": "-",
+        }
+    )
+    text = text.translate(quote_map)
+    text = text.replace("…", "...")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _build_norm_index_map(text: str) -> tuple[str, list[int]]:
+    norm_chars: list[str] = []
+    orig_at: list[int] = []
+    i = 0
+    pending_space = False
+    while i < len(text):
+        chunk = text[i : i + 1]
+        if chunk.isspace():
+            pending_space = bool(norm_chars)
+            i += 1
+            continue
+        if pending_space and norm_chars:
+            norm_chars.append(" ")
+            orig_at.append(i)
+            pending_space = False
+        translated = chunk.translate(
+            str.maketrans(
+                {
+                    "\u201c": '"',
+                    "\u201d": '"',
+                    "\u2018": "'",
+                    "\u2019": "'",
+                    "\u00ab": '"',
+                    "\u00bb": '"',
+                    "\u2014": "-",
+                    "\u2013": "-",
+                }
+            )
+        )
+        if translated == "…":
+            for ch in "...":
+                norm_chars.append(ch)
+                orig_at.append(i)
+        else:
+            norm_chars.append(translated)
+            orig_at.append(i)
+        i += 1
+    return "".join(norm_chars), orig_at
+
+
+def find_english_match_start(match: str, english_text: str, cursor: int) -> int | None:
     if not match or match.upper() == "NO_MATCH":
-        return False
-    pos = english_text.find(match, max(0, cursor - 200))
-    if pos < 0:
-        pos = english_text.find(match)
-    return pos >= 0
+        return None
+    search_from = max(0, cursor - 200)
+    region = english_text[search_from:]
+    pos = region.find(match)
+    if pos >= 0:
+        return search_from + pos
+    pos = english_text.find(match)
+    if pos >= 0:
+        return pos
+    norm_match = normalize_for_match(match)
+    if len(norm_match) < 8:
+        return None
+    for haystack, base in ((region, search_from), (english_text, 0)):
+        norm_hay, orig_map = _build_norm_index_map(haystack)
+        npos = norm_hay.find(norm_match)
+        if npos >= 0 and orig_map:
+            end_norm = npos + len(norm_match) - 1
+            if end_norm < len(orig_map):
+                return base + orig_map[npos]
+    return None
+
+
+def verify_english_substring(match: str, english_text: str, cursor: int) -> bool:
+    return find_english_match_start(match, english_text, cursor) is not None
+
+
+def advance_cursor_by_words(english_text: str, cursor: int, skip_words: int) -> int:
+    remaining = english_text[cursor:]
+    word_matches = list(re.finditer(r"\S+", remaining))
+    if not word_matches:
+        return len(english_text)
+    idx = min(max(1, skip_words), len(word_matches)) - 1
+    return cursor + word_matches[idx].end()
 
 
 def call_haiku_align(
@@ -664,18 +769,31 @@ def call_haiku_align(
     nahuatl_passage: str,
     index: int,
 ) -> tuple[str, bool, int, int]:
-    message = client.messages.create(
-        model=ALIGNMENT_MODEL,
-        max_tokens=ALIGNMENT_MAX_TOKENS,
-        messages=[
-            {"role": "user", "content": build_alignment_prompt(english_window, nahuatl_passage, index)},
-        ],
-    )
-    raw = normalize_alignment_response(message_text(message))
-    in_tok, out_tok = message_usage(message)
-    if raw.upper() == "NO_MATCH" or len(raw) < 8:
-        return raw, True, in_tok, out_tok
-    return raw, False, in_tok, out_tok
+    last_err: Exception | None = None
+    for attempt in range(API_MAX_RETRIES):
+        try:
+            message = client.messages.create(
+                model=ALIGNMENT_MODEL,
+                max_tokens=ALIGNMENT_MAX_TOKENS,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": build_alignment_prompt(english_window, nahuatl_passage, index),
+                    },
+                ],
+            )
+            raw = normalize_alignment_response(message_text(message))
+            in_tok, out_tok = message_usage(message)
+            if raw.upper() == "NO_MATCH" or len(raw) < 8:
+                return raw, True, in_tok, out_tok
+            return raw, False, in_tok, out_tok
+        except Exception as exc:
+            last_err = exc
+            if attempt < API_MAX_RETRIES - 1 and is_retryable_api_error(exc):
+                time.sleep(min(2**attempt, 30))
+                continue
+            raise
+    raise last_err or RuntimeError("Alignment API call failed")
 
 
 def align_nahuatl_passages(
@@ -685,16 +803,14 @@ def align_nahuatl_passages(
     *,
     out_dir: Path,
     test_mode: bool,
-    nahuatl_paths: list[Path],
-    english_paths: list[Path],
+    content_hash: str,
     settings: dict,
     on_progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[list[AlignmentEntry], int, int]:
     cache_path = alignment_map_path(out_dir, test_mode)
     cached = load_alignment_map(
         cache_path,
-        nahuatl_paths=nahuatl_paths,
-        english_paths=english_paths,
+        content_hash=content_hash,
         settings=settings,
     )
     if cached and len(cached) == len(nahuatl_passages):
@@ -712,21 +828,20 @@ def align_nahuatl_passages(
         english_match, uncertain, in_tok, out_tok = call_haiku_align(client, window, nahuatl, i)
         align_in += in_tok
         align_out += out_tok
-        if not uncertain and verify_english_substring(english_match, english_text, cursor):
-            pos = english_text.find(english_match, max(0, cursor - 200))
-            if pos < 0:
-                pos = english_text.find(english_match)
-            cursor = pos + len(english_match)
+        match_start = find_english_match_start(english_match, english_text, cursor)
+        if not uncertain and match_start is not None:
+            cursor = match_start + len(english_match)
         else:
             uncertain = True
-            english_match = window[: min(len(window), 400)].strip() or "(no match found)"
+            skip = max(50, min(count_words(nahuatl), UNCERTAIN_CURSOR_SKIP_WORDS))
+            cursor = advance_cursor_by_words(english_text, cursor, skip)
+            english_match = "(uncertain — no verified English match)"
         entry = AlignmentEntry(index=i, nahuatl=nahuatl, english=english_match, uncertain=uncertain)
         entries.append(entry)
         save_alignment_map(
             cache_path,
             entries,
-            nahuatl_paths=nahuatl_paths,
-            english_paths=english_paths,
+            content_hash=content_hash,
             settings=settings,
         )
     return entries, align_in, align_out
@@ -1082,11 +1197,11 @@ def write_run_summary(
     ]
     if ai_alignment:
         lines.append(f"Alignment tokens: {alignment_input_tokens} in / {alignment_output_tokens} out")
-        if alignment_cost:
-            lines.append(f"Alignment cost: ${alignment_cost:.4f}")
+    lines.append(f"Alignment cost: ${alignment_cost:.4f}")
+    lines.append(f"Translation cost: ${cost - alignment_cost:.4f}")
     fresh_in = max(0, input_tokens - cache_read_tokens)
     lines.append(f"Fresh input tokens (non-cache): {fresh_in}")
-    lines.append(f"Estimated cost: ${cost:.4f}")
+    lines.append(f"Total estimated cost: ${cost:.4f}")
     if truncated:
         lines.append(f"Truncated passages: {truncated}")
     if failed:
@@ -1214,6 +1329,9 @@ class TranslatorApp:
         self._ai_align_cb: ttk.Checkbutton | None = None
         self._saved_prompt_text = ""
         self._prompt_update_in_progress = False
+        self._summary_alignment_cost = 0.0
+        self._summary_alignment_input = 0
+        self._summary_alignment_output = 0
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1314,6 +1432,14 @@ class TranslatorApp:
 
         self.run_btn = ttk.Button(btn_row, text="Run Translation", command=self.run_translation, state=tk.DISABLED)
         self.run_btn.pack(side=tk.LEFT, padx=6)
+
+        self.run_anyway_btn = ttk.Button(
+            btn_row,
+            text="Run anyway",
+            command=lambda: self.run_translation(allow_uncertain=True),
+            state=tk.DISABLED,
+        )
+        self.run_anyway_btn.pack(side=tk.LEFT, padx=6)
 
         self.retry_btn = ttk.Button(
             btn_row, text="Retry failed passages", command=self.retry_failed, state=tk.DISABLED
@@ -1459,6 +1585,14 @@ class TranslatorApp:
         except OSError as exc:
             messagebox.showerror("Save error", str(exc))
             return False
+        lower = text.lower()
+        if "<english>" not in lower or "<spanish>" not in lower:
+            messagebox.showwarning(
+                "Missing output tags",
+                "This prompt does not mention <english> and <spanish> tags.\n\n"
+                "Translation will fail to parse without them. Consider adding the "
+                "XML output format from the default prompt.",
+            )
         self._saved_prompt_text = text
         self._update_prompt_dirty_indicator()
         self.status_var.set(f"Saved system prompt to {PROMPT_FILE.name}")
@@ -1509,11 +1643,24 @@ class TranslatorApp:
     def _invalidate_split(self):
         self.state.pairs = []
         self.state.aligned = False
-        self.run_btn.configure(state=tk.DISABLED)
-        self.retry_btn.configure(state=tk.DISABLED)
+        self.state.alignment_uncertain = []
+        self.state.pair_uncertain = {}
+        self._refresh_run_buttons()
         self._update_alignment_label(0, 0, aligned=False)
         if self.state.nahuatl_paths and self.state.english_paths:
             self._refresh_split_counts()
+
+    def _refresh_run_buttons(self) -> None:
+        uncertain = bool(self.state.alignment_uncertain)
+        can_run = bool(self.state.pairs and self.state.aligned and not self._running)
+        if uncertain:
+            self.run_btn.configure(state=tk.DISABLED)
+            self.run_anyway_btn.configure(state=tk.NORMAL if can_run else tk.DISABLED)
+        else:
+            self.run_btn.configure(state=tk.NORMAL if can_run else tk.DISABLED)
+            self.run_anyway_btn.configure(state=tk.DISABLED)
+        can_retry = bool(self.state.failed and not self._running)
+        self.retry_btn.configure(state=tk.NORMAL if can_retry else tk.DISABLED)
 
     def _on_split_setting_changed(self):
         if self.state.nahuatl_text and self.state.english_text:
@@ -1762,8 +1909,7 @@ class TranslatorApp:
 
         if not aligned:
             self.state.pairs = []
-            self.run_btn.configure(state=tk.DISABLED)
-            self.retry_btn.configure(state=tk.DISABLED)
+            self._refresh_run_buttons()
             preview_cap = min(PREVIEW_COUNT, len(nahuatl_passages), len(english_passages))
             mismatch_pairs = list(zip(nahuatl_passages[:preview_cap], english_passages[:preview_cap]))
             self._render_preview(list(range(1, preview_cap + 1)), pairs=mismatch_pairs)
@@ -1779,8 +1925,7 @@ class TranslatorApp:
         self.state.pairs = list(zip(nahuatl_passages, english_passages))
         preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
         self._render_preview(preview_nums)
-        self.run_btn.configure(state=tk.NORMAL)
-        self.retry_btn.configure(state=tk.DISABLED)
+        self._refresh_run_buttons()
         test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
         self.status_var.set(
             f"Aligned — {len(self.state.pairs)} pairs{test_label}. Review preview, then Run Translation."
@@ -1805,8 +1950,7 @@ class TranslatorApp:
         )
         preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
         self._render_preview(preview_nums)
-        self.run_btn.configure(state=tk.NORMAL)
-        self.retry_btn.configure(state=tk.DISABLED)
+        self._refresh_run_buttons()
         test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
         note = f" ({uncertain} uncertain)" if uncertain else ""
         self.status_var.set(
@@ -1816,7 +1960,7 @@ class TranslatorApp:
             messagebox.showwarning(
                 "Uncertain matches",
                 f"{uncertain} passage(s) had no clear English match (yellow in preview).\n"
-                "Review with Preview pair # before translating.",
+                "Run Translation is blocked — use Run anyway after review, or re-split.",
             )
 
     def _split_and_align_worker(self):
@@ -1829,6 +1973,7 @@ class TranslatorApp:
 
         out_dir = output_directory(self.state.nahuatl_paths)
         settings = self._alignment_settings()
+        content_hash = source_content_hash(self.state.nahuatl_text, self.state.english_text)
 
         def on_progress(done: int, total: int, msg: str):
             self.root.after(0, lambda: self.status_var.set(msg))
@@ -1841,8 +1986,7 @@ class TranslatorApp:
                 self.state.english_text,
                 out_dir=out_dir,
                 test_mode=self.state.test_mode,
-                nahuatl_paths=self.state.nahuatl_paths,
-                english_paths=self.state.english_paths,
+                content_hash=content_hash,
                 settings=settings,
                 on_progress=on_progress,
             )
@@ -1876,7 +2020,7 @@ class TranslatorApp:
         self.state.retry_indices = list(self.state.failed)
         self.run_translation(retry_only=True)
 
-    def run_translation(self, *, retry_only: bool = False):
+    def run_translation(self, *, retry_only: bool = False, allow_uncertain: bool = False):
         if self._running:
             return
         if not self.state.pairs:
@@ -1884,6 +2028,13 @@ class TranslatorApp:
             return
         if not retry_only and not self.state.aligned:
             messagebox.showerror("Not aligned", "Passage counts must match before running.")
+            return
+        if not allow_uncertain and self.state.alignment_uncertain:
+            messagebox.showwarning(
+                "Uncertain alignment",
+                f"{len(self.state.alignment_uncertain)} passage(s) have uncertain English matches.\n"
+                "Review them in preview (yellow), then click Run anyway if you accept the risk.",
+            )
             return
         if not self._ensure_prompt_saved_for_run():
             return
@@ -1894,6 +2045,18 @@ class TranslatorApp:
         except (ValueError, FileNotFoundError) as exc:
             messagebox.showerror("Setup error", str(exc))
             return
+
+        if retry_only:
+            self._summary_alignment_cost = 0.0
+            self._summary_alignment_input = 0
+            self._summary_alignment_output = 0
+        else:
+            self._summary_alignment_cost = self.state.alignment_cost
+            self._summary_alignment_input = self.state.alignment_input_tokens
+            self._summary_alignment_output = self.state.alignment_output_tokens
+            self.state.alignment_cost = 0.0
+            self.state.alignment_input_tokens = 0
+            self.state.alignment_output_tokens = 0
 
         self._set_running_ui(True)
         if not retry_only:
@@ -1915,10 +2078,7 @@ class TranslatorApp:
         self._running = running
         state = tk.DISABLED if running else tk.NORMAL
         self.preview_btn.configure(state=state)
-        can_run = bool(self.state.pairs and self.state.aligned and not running)
-        self.run_btn.configure(state=tk.NORMAL if can_run else tk.DISABLED)
-        can_retry = bool(self.state.failed and not running)
-        self.retry_btn.configure(state=tk.NORMAL if can_retry else tk.DISABLED)
+        self._refresh_run_buttons()
         for rb in self._mode_radios:
             rb.configure(state=state)
         if self._test_mode_cb is not None:
@@ -1927,6 +2087,8 @@ class TranslatorApp:
             self._ai_align_cb.configure(state=state)
         for w in self._split_widgets:
             w.configure(state=state)
+        if running:
+            self.run_anyway_btn.configure(state=tk.DISABLED)
         cursor = "watch" if running else ""
         self.nahuatl_zone.configure(cursor=cursor)
         self.english_zone.configure(cursor=cursor)
@@ -1937,8 +2099,10 @@ class TranslatorApp:
         return list(range(1, len(self.state.pairs) + 1))
 
     def _try_load_existing(self, out_dir: Path, index: int) -> PassageResult | None:
+        nahuatl, english = self.state.pairs[index - 1]
+        expected_fp = pair_fingerprint(nahuatl, english)
         existing = load_passage_record(passage_record_path(out_dir, index, self.state.test_mode))
-        if passage_is_resumable(existing):
+        if passage_is_resumable(existing, expected_fp):
             existing.skipped = True
             return existing
         return None
@@ -1977,6 +2141,11 @@ class TranslatorApp:
             failed.append(result.index)
         elif result.truncated:
             truncated.append(result.index)
+        if not result.skipped and not result.error:
+            if 1 <= result.index <= len(self.state.pairs):
+                nah, eng = self.state.pairs[result.index - 1]
+                result.pair_fingerprint = pair_fingerprint(nah, eng)
+                result.uncertain_match = self.state.pair_uncertain.get(result.index, False)
         if not result.skipped:
             persist_passage_output(out_dir, result, self.state.test_mode)
         if not result.skipped:
@@ -2165,16 +2334,16 @@ class TranslatorApp:
                 english_paths=self.state.english_paths,
                 input_tokens=self.state.total_input_tokens,
                 output_tokens=self.state.total_output_tokens,
-                cost=self.state.total_cost + self.state.alignment_cost,
+                cost=self.state.total_cost + self._summary_alignment_cost,
                 batch_ids=self.state.batch_ids if batch else None,
                 test_mode=self.state.test_mode,
                 skipped_count=len(skipped),
                 cache_read_tokens=self.state.cache_read_tokens,
                 cache_creation_tokens=self.state.cache_creation_tokens,
                 ai_alignment=self.state.ai_alignment,
-                alignment_input_tokens=self.state.alignment_input_tokens,
-                alignment_output_tokens=self.state.alignment_output_tokens,
-                alignment_cost=self.state.alignment_cost,
+                alignment_input_tokens=self._summary_alignment_input,
+                alignment_output_tokens=self._summary_alignment_output,
+                alignment_cost=self._summary_alignment_cost,
             )
             names = output_filenames(test_mode=self.state.test_mode)
             batch_state = out_dir / names["batch_state"]
@@ -2186,6 +2355,7 @@ class TranslatorApp:
 
         self.retry_btn.configure(state=tk.NORMAL if failed else tk.DISABLED)
         ok = len(results) - len(failed) - len(truncated)
+        translation_cost = self.state.total_cost
         summary = (
             f"Done — {ok}/{len(results)} complete.\n"
             f"Alignment model: {ALIGNMENT_MODEL if self.state.ai_alignment else 'n/a (mechanical)'}\n"
@@ -2194,7 +2364,9 @@ class TranslatorApp:
             f"Skipped (resume): {len(skipped)}\n"
             f"Prompt cache: {self.state.cache_read_tokens} read / "
             f"{self.state.cache_creation_tokens} written\n"
-            f"Estimated cost: ${self.state.total_cost + self.state.alignment_cost:.4f}\n"
+            f"Alignment cost: ${self._summary_alignment_cost:.4f}\n"
+            f"Translation cost: ${translation_cost:.4f}\n"
+            f"Total estimated cost: ${translation_cost + self._summary_alignment_cost:.4f}\n"
             f"Saved to {out_dir}"
         )
         if truncated:
