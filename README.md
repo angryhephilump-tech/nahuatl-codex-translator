@@ -24,7 +24,7 @@ Never commit API keys to git.
 python nahuatl_translator.py
 ```
 
-1. Drop Nahuatl and English `.txt` files (multiple OK; merged alphabetically by filename).
+1. Drop Nahuatl and English `.txt`/`.md` files on each side (multiple OK). Files merge **in the numbered list order** shown in each drop zone — use **↑↓** to reorder before Split & Preview.
 2. Choose a **split method** and tune settings — passage counts update live.
 3. Leave **AI-assisted alignment** checked (recommended) or turn it off for already-aligned mechanical pairing.
 4. **Split & Preview** — check the green/red alignment banner and eyeball the first ~10 words of each side.

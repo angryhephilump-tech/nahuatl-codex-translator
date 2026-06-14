@@ -275,9 +275,8 @@ def read_text_file(path: Path) -> str:
 
 
 def read_text_files(paths: list[Path]) -> str:
-    ordered = sorted(paths, key=lambda p: p.name.lower())
     parts: list[str] = []
-    for path in ordered:
+    for path in paths:
         text = read_text_file(path).strip()
         if text:
             parts.append(text)
@@ -290,7 +289,7 @@ def output_directory(paths: list[Path]) -> Path:
     parents = {p.resolve().parent for p in paths if p.exists()}
     if len(parents) == 1:
         return next(iter(parents))
-    return sorted(paths, key=lambda p: p.name.lower())[0].resolve().parent
+    return paths[0].resolve().parent
 
 
 def compile_chapter_regex(pattern: str) -> re.Pattern[str]:
@@ -1210,14 +1209,90 @@ def format_uncertain_pairs(indices: list[int]) -> str:
     return f"Uncertain: pairs {shown}{extra}"
 
 
+def bind_vertical_mousewheel(widget: tk.Misc, scroll_target: tk.Misc) -> None:
+    """Bind mouse wheel / trackpad scroll to a scrollable widget (Windows + Linux)."""
+
+    def _scroll(event: tk.Event) -> str:
+        if getattr(event, "num", None) == 5:
+            scroll_target.yview_scroll(1, "units")
+        elif getattr(event, "num", None) == 4:
+            scroll_target.yview_scroll(-1, "units")
+        elif event.delta:
+            scroll_target.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    widget.bind("<MouseWheel>", _scroll)
+    widget.bind("<Button-4>", _scroll)
+    widget.bind("<Button-5>", _scroll)
+
+
+def make_text_readonly(text_widget: tk.Text) -> None:
+    """Keep text selectable/copyable while blocking edits (scroll-friendly vs DISABLED)."""
+
+    def _allow(event: tk.Event) -> str | None:
+        if event.state & 0x4 and event.keysym.lower() in {"c", "a"}:
+            return None
+        if event.keysym in {
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Prior",
+            "Next",
+            "Home",
+            "End",
+            "Shift_L",
+            "Shift_R",
+        }:
+            return None
+        return "break"
+
+    text_widget.bind("<Key>", _allow)
+
+
+def build_scrollable_frame(parent: tk.Misc) -> tuple[tk.Frame, tk.Frame, tk.Canvas]:
+    """Return (outer, inner, canvas) — pack/grid widgets into inner; outer goes in layout."""
+    outer = tk.Frame(parent)
+    outer.columnconfigure(0, weight=1)
+    outer.rowconfigure(0, weight=1)
+
+    canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+    scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    inner = tk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _on_inner_configure(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event: tk.Event) -> None:
+        canvas.itemconfigure(window_id, width=event.width)
+
+    inner.bind("<Configure>", _on_inner_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    bind_vertical_mousewheel(canvas, canvas)
+    bind_vertical_mousewheel(inner, canvas)
+
+    return outer, inner, canvas
+
+
 def format_file_list(paths: list[Path], max_names: int = 2) -> str:
     if not paths:
         return ""
-    names = [p.name for p in sorted(paths, key=lambda p: p.name.lower())]
+    names = [p.name for p in paths]
     if len(names) <= max_names:
         return ", ".join(names)
     shown = ", ".join(names[:max_names])
     return f"{shown} (+{len(names) - max_names} more)"
+
+
+def format_ordered_files(paths: list[Path]) -> str:
+    if not paths:
+        return "(none)"
+    return " → ".join(f"{index + 1}:{path.name}" for index, path in enumerate(paths))
 
 
 def format_pair_preview(
@@ -1320,16 +1395,43 @@ class DropZone(tk.Frame):
         self.allow_multiple = allow_multiple
         self.file_paths: list[Path] = []
         self._default_bg = self.cget("bg")
+        self._list_widgets: list[tk.Widget] = []
 
-        self.label = tk.Label(self, text=label, font=("Segoe UI", 11), wraplength=240)
-        self.label.pack(expand=True, fill=tk.BOTH, padx=12, pady=(20, 8))
+        self.label = tk.Label(self, text=label, font=("Segoe UI", 10), wraplength=280)
+        self.label.pack(fill=tk.X, padx=10, pady=(10, 4))
 
-        self.path_label = tk.Label(self, text="No files loaded", font=("Segoe UI", 9), fg="#555", wraplength=240)
-        self.path_label.pack(padx=8, pady=(0, 8))
+        list_wrap = tk.Frame(self)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self.list_canvas = tk.Canvas(list_wrap, height=96, highlightthickness=0, borderwidth=0)
+        list_scroll = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=self.list_canvas.yview)
+        self.list_canvas.configure(yscrollcommand=list_scroll.set)
+        self.list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.list_inner = tk.Frame(self.list_canvas)
+        self._list_window = self.list_canvas.create_window((0, 0), window=self.list_inner, anchor="nw")
+        self.list_inner.bind(
+            "<Configure>",
+            lambda _e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all")),
+        )
+        self.list_canvas.bind(
+            "<Configure>",
+            lambda e: self.list_canvas.itemconfigure(self._list_window, width=e.width),
+        )
+        bind_vertical_mousewheel(self.list_canvas, self.list_canvas)
+        bind_vertical_mousewheel(self.list_inner, self.list_canvas)
+
+        self.empty_label = tk.Label(
+            self.list_inner,
+            text="No files loaded",
+            font=("Segoe UI", 9),
+            fg="#555",
+            anchor=tk.W,
+        )
+        self.empty_label.pack(fill=tk.X, padx=2, pady=2)
 
         btn_row = tk.Frame(self)
-        btn_row.pack(pady=(0, 10))
-        ttk.Button(btn_row, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=3)
+        btn_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(btn_row, text="Browse…", command=self._browse).pack(side=tk.LEFT, padx=(8, 3))
         ttk.Button(btn_row, text="Clear", command=self._clear).pack(side=tk.LEFT, padx=3)
 
         self.drop_target_register(DND_FILES)
@@ -1338,18 +1440,27 @@ class DropZone(tk.Frame):
         self.dnd_bind("<<DragLeave>>", self._drag_leave)
 
     def _drag_enter(self, _event):
-        self.configure(bg="#dbeafe")
-        self.label.configure(bg="#dbeafe")
-        self.path_label.configure(bg="#dbeafe")
+        self._set_highlight(True)
 
     def _drag_leave(self, _event):
-        self._reset_bg()
+        self._set_highlight(False)
 
-    def _reset_bg(self):
-        bg = self._default_bg
+    def _set_highlight(self, active: bool) -> None:
+        bg = "#dbeafe" if active else self._default_bg
         self.configure(bg=bg)
         self.label.configure(bg=bg)
-        self.path_label.configure(bg=bg)
+        self.list_canvas.configure(bg=bg)
+        self.list_inner.configure(bg=bg)
+        if not self.file_paths:
+            self.empty_label.configure(bg=bg)
+        for widget in self._list_widgets:
+            try:
+                widget.configure(bg=bg)
+            except tk.TclError:
+                pass
+
+    def _reset_bg(self):
+        self._set_highlight(False)
 
     def _valid_paths(self, paths: list[Path]) -> list[Path]:
         good: list[Path] = []
@@ -1392,29 +1503,89 @@ class DropZone(tk.Frame):
             self.add_files(paths, replace=False)
 
     def _clear(self):
+        if not self.file_paths:
+            return
         self.file_paths = []
-        self.path_label.configure(text="No files loaded")
-        self.on_files([])
+        self._refresh_file_list()
+        self.on_files([], change="clear")
 
     def add_files(self, paths: list[Path], *, replace: bool = False):
         if replace:
             merged = list(paths)
         else:
             merged = list(self.file_paths)
+            seen = {p.resolve() for p in merged}
             for path in paths:
                 resolved = path.resolve()
-                if resolved not in {p.resolve() for p in merged}:
+                if resolved not in seen:
                     merged.append(path)
-        merged = sorted(merged, key=lambda p: p.name.lower())
+                    seen.add(resolved)
         self.file_paths = merged
-        count = len(merged)
-        if count == 0:
-            self.path_label.configure(text="No files loaded")
-        elif count == 1:
-            self.path_label.configure(text=merged[0].name)
-        else:
-            self.path_label.configure(text=f"{count} files: {format_file_list(merged)}")
-        self.on_files(merged)
+        self._refresh_file_list()
+        self.on_files(list(self.file_paths), change="add")
+
+    def _move_file(self, index: int, delta: int) -> None:
+        new_index = index + delta
+        if new_index < 0 or new_index >= len(self.file_paths):
+            return
+        paths = list(self.file_paths)
+        paths[index], paths[new_index] = paths[new_index], paths[index]
+        self.file_paths = paths
+        self._refresh_file_list()
+        self.on_files(paths, change="reorder")
+
+    def _refresh_file_list(self) -> None:
+        for child in self.list_inner.winfo_children():
+            child.destroy()
+        self._list_widgets = []
+
+        if not self.file_paths:
+            self.empty_label = tk.Label(
+                self.list_inner,
+                text="No files loaded",
+                font=("Segoe UI", 9),
+                fg="#555",
+                anchor=tk.W,
+            )
+            self.empty_label.pack(fill=tk.X, padx=2, pady=2)
+            self._list_widgets.append(self.empty_label)
+            return
+
+        for index, path in enumerate(self.file_paths):
+            row = tk.Frame(self.list_inner)
+            row.pack(fill=tk.X, pady=1)
+            self._list_widgets.append(row)
+
+            name_label = tk.Label(
+                row,
+                text=f"{index + 1}. {path.name}",
+                font=("Segoe UI", 9),
+                anchor=tk.W,
+                wraplength=210,
+                justify=tk.LEFT,
+            )
+            name_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._list_widgets.append(name_label)
+
+            btn_col = tk.Frame(row)
+            btn_col.pack(side=tk.RIGHT)
+            up_btn = ttk.Button(
+                btn_col,
+                text="↑",
+                width=2,
+                command=lambda i=index: self._move_file(i, -1),
+                state=tk.NORMAL if index > 0 else tk.DISABLED,
+            )
+            up_btn.pack(side=tk.LEFT, padx=(2, 0))
+            down_btn = ttk.Button(
+                btn_col,
+                text="↓",
+                width=2,
+                command=lambda i=index: self._move_file(i, 1),
+                state=tk.NORMAL if index < len(self.file_paths) - 1 else tk.DISABLED,
+            )
+            down_btn.pack(side=tk.LEFT, padx=(2, 0))
+            self._list_widgets.extend([btn_col, up_btn, down_btn])
 
 
 class TranslatorApp:
@@ -1463,10 +1634,17 @@ class TranslatorApp:
         paned = ttk.Panedwindow(parent, orient=tk.VERTICAL)
         paned.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
-        controls = ttk.Frame(paned)
+        controls_outer, controls, _controls_canvas = build_scrollable_frame(paned)
         preview_frame = ttk.LabelFrame(paned, text="Alignment preview")
-        paned.add(controls, weight=1)
+        paned.add(controls_outer, weight=1)
         paned.add(preview_frame, weight=4)
+        try:
+            paned.pane(preview_frame, minsize=200)
+        except tk.TclError:
+            pass
+
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
 
         top = tk.Frame(controls)
         top.pack(fill=tk.X, **pad)
@@ -1476,15 +1654,15 @@ class TranslatorApp:
 
         self.nahuatl_zone = DropZone(
             zones,
-            "Drop Nahuatl file(s) here\n(or Browse — multiple OK)",
-            self._on_nahuatl,
+            "Drop Nahuatl file(s) here\n(merged in list order — use ↑↓ to reorder)",
+            lambda paths, **kw: self._on_nahuatl(paths, **kw),
         )
         self.nahuatl_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(0, 5))
 
         self.english_zone = DropZone(
             zones,
-            "Drop English reference file(s) here\n(or Browse — multiple OK)",
-            self._on_english,
+            "Drop English reference file(s) here\n(merged in list order — use ↑↓ to reorder)",
+            lambda paths, **kw: self._on_english(paths, **kw),
         )
         self.english_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(5, 0))
 
@@ -1630,7 +1808,7 @@ class TranslatorApp:
         ).pack(anchor=tk.W, padx=12)
 
         jump_row = tk.Frame(preview_frame)
-        jump_row.pack(fill=tk.X, padx=6, pady=4)
+        jump_row.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
         ttk.Label(jump_row, text="Preview pair #").pack(side=tk.LEFT)
         self.preview_pair_var = tk.StringVar(value="1")
         ttk.Entry(jump_row, textvariable=self.preview_pair_var, width=8).pack(side=tk.LEFT, padx=4)
@@ -1644,7 +1822,7 @@ class TranslatorApp:
         self.next_uncertain_btn.pack(side=tk.LEFT)
 
         preview_body = tk.Frame(preview_frame)
-        preview_body.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        preview_body.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
         preview_body.columnconfigure(0, weight=1)
         preview_body.rowconfigure(0, weight=1)
 
@@ -1660,11 +1838,14 @@ class TranslatorApp:
         self.preview_text.grid(row=0, column=0, sticky="nsew")
         preview_scroll.config(command=self.preview_text.yview)
         self.preview_text.tag_configure("uncertain", background="#fef9c3")
-        self.preview_text.configure(state=tk.DISABLED)
+        make_text_readonly(self.preview_text)
+        bind_vertical_mousewheel(self.preview_text, self.preview_text)
+        bind_vertical_mousewheel(preview_body, self.preview_text)
+        bind_vertical_mousewheel(preview_frame, self.preview_text)
 
         def _set_initial_sash():
             try:
-                paned.sashpos(0, min(420, max(280, parent.winfo_height() // 3)))
+                paned.sashpos(0, min(380, max(240, parent.winfo_height() // 4)))
             except tk.TclError:
                 pass
 
@@ -1935,15 +2116,38 @@ class TranslatorApp:
             self._refresh_split_counts()
         self._invalidate_split()
 
-    def _on_nahuatl(self, paths: list[Path]):
-        self.state.nahuatl_paths = paths
-        self._invalidate_split()
-        self._update_ready_status()
+    def _clear_preview(self) -> None:
+        self.preview_text.delete("1.0", tk.END)
 
-    def _on_english(self, paths: list[Path]):
-        self.state.english_paths = paths
+    def _apply_path_change(self, side: str, paths: list[Path], *, change: str = "add") -> None:
+        had_split = bool(self.state.pairs)
+        if side == "nahuatl":
+            self.state.nahuatl_paths = paths
+        else:
+            self.state.english_paths = paths
         self._invalidate_split()
-        self._update_ready_status()
+        if had_split:
+            self._clear_preview()
+            if change == "reorder":
+                self.status_var.set("Merge order changed — run Split & Preview again.")
+                messagebox.showinfo(
+                    "Re-split needed",
+                    "File merge order changed.\n\nRun Split & Preview again before translating.",
+                )
+            elif change == "add":
+                self.status_var.set("Files added — run Split & Preview again.")
+            elif change == "clear":
+                self.status_var.set("Files cleared.")
+            else:
+                self.status_var.set("File list changed — run Split & Preview again.")
+        else:
+            self._update_ready_status()
+
+    def _on_nahuatl(self, paths: list[Path], *, change: str = "add"):
+        self._apply_path_change("nahuatl", paths, change=change)
+
+    def _on_english(self, paths: list[Path], *, change: str = "add"):
+        self._apply_path_change("english", paths, change=change)
 
     def _update_ready_status(self):
         n = len(self.state.nahuatl_paths)
@@ -2176,8 +2380,8 @@ class TranslatorApp:
                 f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words after first heading\n"
             )
         lines.append(
-            f"Sources: Nahuatl [{format_file_list(self.state.nahuatl_paths)}] | "
-            f"English [{format_file_list(self.state.english_paths)}]\n"
+            f"Sources: Nahuatl [{format_ordered_files(self.state.nahuatl_paths)}] | "
+            f"English [{format_ordered_files(self.state.english_paths)}]\n"
         )
         lines.append(f"Split: {self.split_method_var.get()}\n")
         if self.state.ai_alignment:
@@ -2190,7 +2394,6 @@ class TranslatorApp:
             nah, eng = source_pairs[i - 1]
             uncertain = self.state.pair_uncertain.get(i, False)
             pair_blocks.append((format_pair_preview(i, nah, eng, uncertain=uncertain), uncertain))
-        self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.delete("1.0", tk.END)
         if lines:
             self.preview_text.insert(tk.END, "\n".join(lines))
@@ -2200,7 +2403,6 @@ class TranslatorApp:
                 self.preview_text.insert(tk.END, block_text, "uncertain")
             else:
                 self.preview_text.insert(tk.END, block_text)
-        self.preview_text.configure(state=tk.DISABLED)
 
     def _show_preview_pair(self):
         if not self.state.pairs:
