@@ -18,3 +18,7 @@ batch_state.json
 batch_state_test.json
 failed_passages.log
 failed_passages_test.log
+truncated.log
+truncated_test.log
+passages/
+passages_test/

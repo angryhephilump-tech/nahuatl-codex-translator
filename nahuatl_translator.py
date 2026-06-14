@@ -9,7 +9,7 @@ import re
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -29,22 +29,28 @@ INPUT_COST_PER_M = 5.0
 OUTPUT_COST_PER_M = 25.0
 BATCH_DISCOUNT = 0.5
 PREVIEW_COUNT = 3
+PREVIEW_HEAD_WORDS = 10
 TEST_MODE_WORD_LIMIT = 300
+LARGE_PASSAGE_WORDS = 3000
+DEFAULT_WORDS_PER_PASSAGE = 400
 API_MAX_RETRIES = 4
 BATCH_POLL_SEC = 15
 BATCH_MAX_REQUESTS = 5000
 TEXT_SUFFIXES = {".txt", ".text", ".md"}
 ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
-CHAPTER_HEADING_RE = re.compile(
+SPLIT_CHAPTER = "chapter"
+SPLIT_PARAGRAPH = "paragraph"
+SPLIT_WORDS = "words"
+
+DEFAULT_CHAPTER_REGEX = (
     r"^(?:"
     r"(?:Chapter|CHAPTER|Cap[ií]tulo|CAP[IÍ]TULO|Book|BOOK|Libro|LIBRO)\s+[\w\dIVXLCivxlc\-]+.*"
     r"|#{1,3}\s+\S.+"
     r"|\*{2,}.+\*{2,}"
     r"|[IVXLC]+\.\s+\S"
     r"|\d+\.\s+[A-Z].+"
-    r")\s*$",
-    re.MULTILINE,
+    r")\s*$"
 )
 
 TAG_RE = {
@@ -52,6 +58,40 @@ TAG_RE = {
     "spanish": re.compile(r"<spanish>(.*?)</spanish>", re.DOTALL | re.IGNORECASE),
     "flags": re.compile(r"<flags>(.*?)</flags>", re.DOTALL | re.IGNORECASE),
 }
+
+
+@dataclass
+class PassageResult:
+    index: int
+    english: str = ""
+    spanish: str = ""
+    flags: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    error: str | None = None
+    truncated: bool = False
+    skipped: bool = False
+
+
+@dataclass
+class RunState:
+    pairs: list[tuple[str, str]] = field(default_factory=list)
+    nahuatl_paths: list[Path] = field(default_factory=list)
+    english_paths: list[Path] = field(default_factory=list)
+    nahuatl_text: str = ""
+    english_text: str = ""
+    nahuatl_passage_count: int = 0
+    english_passage_count: int = 0
+    aligned: bool = False
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost: float = 0.0
+    results: list[PassageResult] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)
+    truncated: list[int] = field(default_factory=list)
+    batch_ids: list[str] = field(default_factory=list)
+    test_mode: bool = False
+    retry_indices: list[int] = field(default_factory=list)
 
 
 def _read_env_key() -> str:
@@ -109,7 +149,6 @@ def load_system_prompt() -> str:
 
 
 def parse_drop_paths(tk_root: tk.Misc, data: str) -> list[Path]:
-    """Parse one or many file paths from a drag-and-drop event (Windows-safe)."""
     raw = (data or "").strip()
     if not raw:
         return []
@@ -142,7 +181,6 @@ def read_text_file(path: Path) -> str:
 
 
 def read_text_files(paths: list[Path]) -> str:
-    """Read multiple files in sorted name order, joined with a blank line."""
     ordered = sorted(paths, key=lambda p: p.name.lower())
     parts: list[str] = []
     for path in ordered:
@@ -161,25 +199,66 @@ def output_directory(paths: list[Path]) -> Path:
     return sorted(paths, key=lambda p: p.name.lower())[0].resolve().parent
 
 
-def split_passages(text: str) -> list[str]:
+def compile_chapter_regex(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern, re.MULTILINE)
+
+
+def split_by_chapters(text: str, chapter_re: re.Pattern[str]) -> list[str]:
     text = text.strip()
     if not text:
         return []
+    headings = list(chapter_re.finditer(text))
+    if not headings:
+        return []
+    starts = [m.start() for m in headings]
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    chunks: list[str] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
 
-    headings = list(CHAPTER_HEADING_RE.finditer(text))
-    if headings:
-        starts = [m.start() for m in headings]
-        if starts[0] != 0:
-            starts.insert(0, 0)
-        chunks: list[str] = []
-        for i, start in enumerate(starts):
-            end = starts[i + 1] if i + 1 < len(starts) else len(text)
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append(chunk)
-        return chunks
 
+def split_by_paragraphs(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
     return [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+
+
+def split_by_word_count(text: str, words_per_passage: int) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    words = re.findall(r"\S+", text)
+    if not words:
+        return []
+    n = max(1, words_per_passage)
+    return [" ".join(words[i : i + n]) for i in range(0, len(words), n)]
+
+
+def split_passages(
+    text: str,
+    method: str,
+    *,
+    chapter_pattern: str = DEFAULT_CHAPTER_REGEX,
+    words_per_passage: int = DEFAULT_WORDS_PER_PASSAGE,
+) -> list[str]:
+    if method == SPLIT_CHAPTER:
+        try:
+            chapter_re = compile_chapter_regex(chapter_pattern)
+        except re.error as exc:
+            raise ValueError(f"Invalid chapter regex: {exc}") from exc
+        chunks = split_by_chapters(text, chapter_re)
+        if chunks:
+            return chunks
+        return split_by_paragraphs(text)
+    if method == SPLIT_WORDS:
+        return split_by_word_count(text, words_per_passage)
+    return split_by_paragraphs(text)
 
 
 def count_words(text: str) -> int:
@@ -187,12 +266,24 @@ def count_words(text: str) -> int:
 
 
 def truncate_words(text: str, max_words: int) -> tuple[str, int, bool]:
-    """Return (text, word_count, was_truncated)."""
     words = re.findall(r"\S+", text.strip())
     if len(words) <= max_words:
         return text.strip(), len(words), False
-    cut = " ".join(words[:max_words])
-    return cut, max_words, True
+    return " ".join(words[:max_words]), max_words, True
+
+
+def first_words(text: str, n: int = PREVIEW_HEAD_WORDS) -> str:
+    words = re.findall(r"\S+", text.strip())
+    if not words:
+        return "(empty)"
+    preview = " ".join(words[:n])
+    if len(words) > n:
+        preview += "…"
+    return preview
+
+
+def passage_marker(index: int) -> str:
+    return f"=== Passage {index:03d} ==="
 
 
 def output_filenames(*, test_mode: bool) -> dict[str, str]:
@@ -204,8 +295,135 @@ def output_filenames(*, test_mode: bool) -> dict[str, str]:
         "summary_json": f"run_summary{suffix}.json",
         "summary_txt": f"run_summary{suffix}.txt",
         "failed_log": f"failed_passages{suffix}.log",
+        "truncated_log": f"truncated{suffix}.log",
         "batch_state": f"batch_state{suffix}.json",
+        "passages_dir": f"passages{suffix}",
     }
+
+
+def passages_dir(out_dir: Path, test_mode: bool) -> Path:
+    d = out_dir / output_filenames(test_mode=test_mode)["passages_dir"]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def passage_record_path(out_dir: Path, index: int, test_mode: bool) -> Path:
+    return passages_dir(out_dir, test_mode) / f"passage_{index:05d}.json"
+
+
+def load_passage_record(path: Path) -> PassageResult | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return PassageResult(
+            index=int(data["index"]),
+            english=data.get("english", ""),
+            spanish=data.get("spanish", ""),
+            flags=data.get("flags"),
+            input_tokens=int(data.get("input_tokens", 0)),
+            output_tokens=int(data.get("output_tokens", 0)),
+            error=data.get("error"),
+            truncated=bool(data.get("truncated", False)),
+            skipped=bool(data.get("skipped", False)),
+        )
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def passage_is_resumable(result: PassageResult | None) -> bool:
+    if result is None or result.error or result.truncated:
+        return False
+    return bool(result.english.strip() and result.spanish.strip())
+
+
+def save_passage_record(out_dir: Path, result: PassageResult, test_mode: bool) -> None:
+    path = passage_record_path(out_dir, result.index, test_mode)
+    path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+
+
+def rebuild_aggregate_file(
+    out_dir: Path,
+    *,
+    test_mode: bool,
+    field_name: str,
+    filename_key: str,
+) -> None:
+    names = output_filenames(test_mode=test_mode)
+    pdir = out_dir / names["passages_dir"]
+    if not pdir.is_dir():
+        return
+    blocks: list[str] = []
+    for path in sorted(pdir.glob("passage_*.json")):
+        rec = load_passage_record(path)
+        if rec is None:
+            continue
+        marker = passage_marker(rec.index)
+        if rec.error:
+            body = f"[FAILED: {rec.error}]"
+        elif rec.truncated:
+            body = getattr(rec, field_name, "") + "\n[TRUNCATED — output hit max_tokens]"
+        else:
+            body = getattr(rec, field_name, "")
+        blocks.append(f"{marker}\n{body}")
+    if blocks:
+        (out_dir / names[filename_key]).write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def rebuild_flags_file(out_dir: Path, test_mode: bool) -> None:
+    names = output_filenames(test_mode=test_mode)
+    pdir = out_dir / names["passages_dir"]
+    if not pdir.is_dir():
+        return
+    blocks: list[str] = []
+    for path in sorted(pdir.glob("passage_*.json")):
+        rec = load_passage_record(path)
+        if rec and rec.flags and not rec.error:
+            blocks.append(f"{passage_marker(rec.index)}\n{rec.flags}")
+    flags_path = out_dir / names["flags"]
+    if blocks:
+        flags_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+    elif flags_path.is_file():
+        flags_path.unlink()
+
+
+def rebuild_failed_log(out_dir: Path, test_mode: bool) -> None:
+    names = output_filenames(test_mode=test_mode)
+    pdir = out_dir / names["passages_dir"]
+    lines: list[str] = []
+    if pdir.is_dir():
+        for path in sorted(pdir.glob("passage_*.json")):
+            rec = load_passage_record(path)
+            if rec and rec.error:
+                lines.append(f"Passage {rec.index}: {rec.error}")
+    log_path = out_dir / names["failed_log"]
+    if lines:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif log_path.is_file():
+        log_path.unlink()
+
+
+def rebuild_truncated_log(out_dir: Path, test_mode: bool) -> None:
+    names = output_filenames(test_mode=test_mode)
+    pdir = out_dir / names["passages_dir"]
+    lines: list[str] = []
+    if pdir.is_dir():
+        for path in sorted(pdir.glob("passage_*.json")):
+            rec = load_passage_record(path)
+            if rec and rec.truncated:
+                lines.append(f"Passage {rec.index}: stop_reason=max_tokens (output cut off)")
+    log_path = out_dir / names["truncated_log"]
+    if lines:
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    elif log_path.is_file():
+        log_path.unlink()
+
+
+def persist_passage_output(out_dir: Path, result: PassageResult, test_mode: bool) -> None:
+    save_passage_record(out_dir, result, test_mode)
+    rebuild_aggregate_file(out_dir, test_mode=test_mode, field_name="english", filename_key="english")
+    rebuild_aggregate_file(out_dir, test_mode=test_mode, field_name="spanish", filename_key="spanish")
+    rebuild_flags_file(out_dir, test_mode)
 
 
 def build_user_message(nahuatl: str, english: str) -> str:
@@ -233,6 +451,14 @@ def message_usage(message: anthropic.types.Message | dict) -> tuple[int, int]:
     if isinstance(usage, dict):
         return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
     return int(getattr(usage, "input_tokens", 0)), int(getattr(usage, "output_tokens", 0))
+
+
+def message_stop_reason(message: anthropic.types.Message | dict) -> str | None:
+    if hasattr(message, "stop_reason"):
+        return getattr(message, "stop_reason", None)
+    if isinstance(message, dict):
+        return message.get("stop_reason")
+    return None
 
 
 def parse_response(text: str) -> dict[str, str | None]:
@@ -279,18 +505,26 @@ def apply_parsed_response(result: PassageResult, response_text: str) -> None:
     result.flags = parsed.get("flags")
 
 
+def apply_message_to_result(result: PassageResult, message: anthropic.types.Message | dict) -> None:
+    apply_parsed_response(result, message_text(message))
+    in_tok, out_tok = message_usage(message)
+    result.input_tokens = in_tok
+    result.output_tokens = out_tok
+    if message_stop_reason(message) == "max_tokens":
+        result.truncated = True
+
+
 def create_translation_batch(
     client: anthropic.Anthropic,
     system_prompt: str,
-    pairs: list[tuple[str, str]],
-    start_index: int = 1,
+    indexed_pairs: list[tuple[int, str, str]],
 ) -> str:
     requests = [
         {
-            "custom_id": batch_custom_id(i),
+            "custom_id": batch_custom_id(index),
             "params": build_message_params(system_prompt, nahuatl, english),
         }
-        for i, (nahuatl, english) in enumerate(pairs, start=start_index)
+        for index, nahuatl, english in indexed_pairs
     ]
     batch = client.messages.batches.create(requests=requests)
     batch_id = getattr(batch, "id", None) or (batch.get("id") if isinstance(batch, dict) else None)
@@ -326,21 +560,18 @@ def batch_counts_done(batch: object) -> tuple[int, int]:
     if counts is None:
         return 0, 0
     if isinstance(counts, dict):
-        processing = int(counts.get("processing", 0))
         done = sum(int(counts.get(k, 0)) for k in ("succeeded", "errored", "canceled", "expired"))
     else:
-        processing = int(getattr(counts, "processing", 0))
         done = sum(
             int(getattr(counts, k, 0))
             for k in ("succeeded", "errored", "canceled", "expired")
         )
-    return done, done + processing
+    return done, done + int(
+        counts.get("processing", 0) if isinstance(counts, dict) else getattr(counts, "processing", 0)
+    )
 
 
-def collect_batch_results(
-    client: anthropic.Anthropic,
-    batch_id: str,
-) -> dict[int, PassageResult]:
+def collect_batch_results(client: anthropic.Anthropic, batch_id: str) -> dict[int, PassageResult]:
     by_index: dict[int, PassageResult] = {}
     for entry in client.messages.batches.results(batch_id):
         custom_id = getattr(entry, "custom_id", None) or (
@@ -363,10 +594,7 @@ def collect_batch_results(
         if rtype == "succeeded":
             message = getattr(raw_result, "message", None) or raw_result.get("message")
             try:
-                apply_parsed_response(result, message_text(message))
-                in_tok, out_tok = message_usage(message)
-                result.input_tokens = in_tok
-                result.output_tokens = out_tok
+                apply_message_to_result(result, message)
             except Exception as exc:
                 result.error = str(exc)
         elif rtype == "errored":
@@ -422,12 +650,22 @@ def format_file_list(paths: list[Path], max_names: int = 2) -> str:
     return f"{shown} (+{len(names) - max_names} more)"
 
 
+def format_pair_preview(index: int, nahuatl: str, english: str) -> list[str]:
+    return [
+        f"=== Pair {index} ===",
+        f"  Nahuatl : {first_words(nahuatl)}",
+        f"  English : {first_words(english)}",
+        "",
+    ]
+
+
 def write_run_summary(
     out_dir: Path,
     *,
     mode: str,
     results: list[PassageResult],
     failed: list[int],
+    truncated: list[int],
     nahuatl_paths: list[Path],
     english_paths: list[Path],
     input_tokens: int,
@@ -435,7 +673,7 @@ def write_run_summary(
     cost: float,
     batch_ids: list[str] | None = None,
     test_mode: bool = False,
-    test_word_limit: int = TEST_MODE_WORD_LIMIT,
+    skipped_count: int = 0,
 ) -> None:
     model = resolve_model()
     names = output_filenames(test_mode=test_mode)
@@ -443,11 +681,13 @@ def write_run_summary(
         "model": model,
         "mode": mode,
         "test_mode": test_mode,
-        "test_word_limit": test_word_limit if test_mode else None,
         "passages_total": len(results),
-        "passages_succeeded": len(results) - len(failed),
+        "passages_succeeded": len([r for r in results if not r.error and not r.truncated]),
         "passages_failed": len(failed),
+        "passages_truncated": len(truncated),
+        "passages_skipped_resume": skipped_count,
         "failed_passage_numbers": failed,
+        "truncated_passage_numbers": truncated,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "estimated_cost_usd": round(cost, 4),
@@ -455,55 +695,22 @@ def write_run_summary(
         "batch_ids": batch_ids or [],
         "nahuatl_files": [str(p) for p in nahuatl_paths],
         "english_files": [str(p) for p in english_paths],
-        "outputs": {
-            "english": str(out_dir / names["english"]),
-            "spanish": str(out_dir / names["spanish"]),
-            "flags": str(out_dir / names["flags"]) if any(r.flags for r in results if not r.error) else None,
-        },
     }
     (out_dir / names["summary_json"]).write_text(json.dumps(stats, indent=2), encoding="utf-8")
     lines = [
         "Nahuatl Codex Translator — run summary",
         f"Model: {model}",
         f"Mode: {'Batch (~50% off)' if mode == 'batch' else 'Live (full price)'}",
-    ]
-    if test_mode:
-        lines.append(f"Test mode: first {test_word_limit} words only")
-    lines.extend([
-        f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} succeeded",
+        f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} OK",
+        f"Skipped (resume): {skipped_count}",
         f"Tokens: {input_tokens} in / {output_tokens} out",
         f"Estimated cost: ${cost:.4f}",
-    ])
-    if batch_ids:
-        lines.append(f"Batch IDs: {', '.join(batch_ids)}")
+    ]
+    if truncated:
+        lines.append(f"Truncated passages: {truncated}")
     if failed:
         lines.append(f"Failed passages: {failed}")
     (out_dir / names["summary_txt"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-@dataclass
-class PassageResult:
-    index: int
-    english: str = ""
-    spanish: str = ""
-    flags: str | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
-    error: str | None = None
-
-
-@dataclass
-class RunState:
-    pairs: list[tuple[str, str]] = field(default_factory=list)
-    nahuatl_paths: list[Path] = field(default_factory=list)
-    english_paths: list[Path] = field(default_factory=list)
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    total_cost: float = 0.0
-    results: list[PassageResult] = field(default_factory=list)
-    failed: list[int] = field(default_factory=list)
-    batch_ids: list[str] = field(default_factory=list)
-    test_mode: bool = False
 
 
 class DropZone(tk.Frame):
@@ -614,19 +821,21 @@ class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
         self.root.title(f"Nahuatl Codex Translator — {resolve_model()}")
-        self.root.geometry("820x700")
-        self.root.minsize(720, 580)
+        self.root.geometry("860x820")
+        self.root.minsize(760, 680)
 
         self.state = RunState()
         self._running = False
+        self._progress_done = 0
+        self._progress_total = 0
         self._mode_radios: list[ttk.Radiobutton] = []
-        self._test_mode_cb: ttk.Checkbutton | None = None
+        self._split_widgets: list[tk.Widget] = []
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        pad = {"padx": 10, "pady": 4}
 
         top = tk.Frame(self.root)
         top.pack(fill=tk.X, **pad)
@@ -648,6 +857,49 @@ class TranslatorApp:
         )
         self.english_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(5, 0))
 
+        split_frame = ttk.LabelFrame(self.root, text="Split method")
+        split_frame.pack(fill=tk.X, padx=10, pady=4)
+
+        self.split_method_var = tk.StringVar(value=SPLIT_CHAPTER)
+        method_row = tk.Frame(split_frame)
+        method_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(method_row, text="Method:").pack(side=tk.LEFT)
+        method_cb = ttk.Combobox(
+            method_row,
+            textvariable=self.split_method_var,
+            values=["Chapter headings", "Paragraph breaks (\\n\\n)", "Every N words"],
+            state="readonly",
+            width=28,
+        )
+        method_cb.pack(side=tk.LEFT, padx=6)
+        method_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_split_setting_changed())
+        self._split_widgets.append(method_cb)
+
+        regex_row = tk.Frame(split_frame)
+        regex_row.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(regex_row, text="Chapter regex:").pack(side=tk.LEFT)
+        self.chapter_regex_var = tk.StringVar(value=DEFAULT_CHAPTER_REGEX)
+        regex_entry = ttk.Entry(regex_row, textvariable=self.chapter_regex_var)
+        regex_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        regex_entry.bind("<KeyRelease>", lambda _e: self._on_split_setting_changed())
+        self._split_widgets.append(regex_entry)
+
+        words_row = tk.Frame(split_frame)
+        words_row.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(words_row, text="Words per passage:").pack(side=tk.LEFT)
+        self.words_per_passage_var = tk.StringVar(value=str(DEFAULT_WORDS_PER_PASSAGE))
+        words_entry = ttk.Entry(words_row, textvariable=self.words_per_passage_var, width=8)
+        words_entry.pack(side=tk.LEFT, padx=6)
+        words_entry.bind("<KeyRelease>", lambda _e: self._on_split_setting_changed())
+        self._split_widgets.append(words_entry)
+
+        self.split_count_var = tk.StringVar(value="Passage counts: —")
+        ttk.Label(split_frame, textvariable=self.split_count_var).pack(anchor=tk.W, padx=6, pady=2)
+        self.large_passage_var = tk.StringVar(value="")
+        ttk.Label(split_frame, textvariable=self.large_passage_var, foreground="#b45309").pack(
+            anchor=tk.W, padx=6, pady=(0, 4)
+        )
+
         btn_row = tk.Frame(self.root)
         btn_row.pack(fill=tk.X, **pad)
 
@@ -655,7 +907,12 @@ class TranslatorApp:
         self.preview_btn.pack(side=tk.LEFT)
 
         self.run_btn = ttk.Button(btn_row, text="Run Translation", command=self.run_translation, state=tk.DISABLED)
-        self.run_btn.pack(side=tk.LEFT, padx=8)
+        self.run_btn.pack(side=tk.LEFT, padx=6)
+
+        self.retry_btn = ttk.Button(
+            btn_row, text="Retry failed passages", command=self.retry_failed, state=tk.DISABLED
+        )
+        self.retry_btn.pack(side=tk.LEFT, padx=6)
 
         self.mode_var = tk.StringVar(value="batch")
         mode_frame = tk.Frame(btn_row)
@@ -670,9 +927,17 @@ class TranslatorApp:
             btn_row,
             text=f"Test mode (first {TEST_MODE_WORD_LIMIT} words)",
             variable=self.test_mode_var,
-            command=self._on_test_mode_toggle,
+            command=self._invalidate_split,
         )
-        self._test_mode_cb.pack(side=tk.LEFT, padx=8)
+        self._test_mode_cb.pack(side=tk.LEFT, padx=6)
+
+        self.alignment_label = tk.Label(
+            self.root,
+            text="Alignment: run Split & Preview",
+            font=("Segoe UI", 11, "bold"),
+            fg="#666",
+        )
+        self.alignment_label.pack(anchor=tk.W, padx=12, pady=2)
 
         model_label = tk.Label(
             self.root,
@@ -680,13 +945,20 @@ class TranslatorApp:
             font=("Segoe UI", 9),
             fg="#666",
         )
-        model_label.pack(anchor=tk.W, padx=12, pady=(0, 2))
+        model_label.pack(anchor=tk.W, padx=12)
 
-        preview_frame = ttk.LabelFrame(self.root, text="Preview (first 3 pairs)")
-        preview_frame.pack(fill=tk.BOTH, expand=True, **pad)
+        preview_frame = ttk.LabelFrame(self.root, text="Alignment preview")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        jump_row = tk.Frame(preview_frame)
+        jump_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(jump_row, text="Preview pair #").pack(side=tk.LEFT)
+        self.preview_pair_var = tk.StringVar(value="1")
+        ttk.Entry(jump_row, textvariable=self.preview_pair_var, width=8).pack(side=tk.LEFT, padx=4)
+        ttk.Button(jump_row, text="Show", command=self._show_preview_pair).pack(side=tk.LEFT)
 
         self.preview_text = scrolledtext.ScrolledText(
-            preview_frame, height=12, wrap=tk.WORD, font=("Consolas", 10)
+            preview_frame, height=14, wrap=tk.WORD, font=("Consolas", 10)
         )
         self.preview_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.preview_text.configure(state=tk.DISABLED)
@@ -698,122 +970,253 @@ class TranslatorApp:
         self.progress.pack(fill=tk.X, pady=4)
 
         self.status_var = tk.StringVar(value="Drop file(s) on both sides, then Split & Preview.")
-        tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W, wraplength=780).pack(fill=tk.X)
+        tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W, wraplength=820).pack(fill=tk.X)
 
-    def _on_test_mode_toggle(self):
+    def _split_method_key(self) -> str:
+        label = self.split_method_var.get()
+        if label.startswith("Paragraph"):
+            return SPLIT_PARAGRAPH
+        if label.startswith("Every"):
+            return SPLIT_WORDS
+        return SPLIT_CHAPTER
+
+    def _words_per_passage(self) -> int:
+        try:
+            return max(1, int(self.words_per_passage_var.get().strip()))
+        except ValueError:
+            return DEFAULT_WORDS_PER_PASSAGE
+
+    def _invalidate_split(self):
         self.state.pairs = []
+        self.state.aligned = False
         self.run_btn.configure(state=tk.DISABLED)
+        self.retry_btn.configure(state=tk.DISABLED)
+        self._update_alignment_label(0, 0, aligned=False)
         if self.state.nahuatl_paths and self.state.english_paths:
-            self.status_var.set(
-                f"Test mode {'on' if self.test_mode_var.get() else 'off'} — click Split & Preview again."
-            )
+            self._refresh_split_counts()
+
+    def _on_split_setting_changed(self):
+        if self.state.nahuatl_text and self.state.english_text:
+            self._refresh_split_counts()
+        self._invalidate_split()
 
     def _on_nahuatl(self, paths: list[Path]):
         self.state.nahuatl_paths = paths
-        self.state.pairs = []
-        self.run_btn.configure(state=tk.DISABLED)
+        self._invalidate_split()
         self._update_ready_status()
 
     def _on_english(self, paths: list[Path]):
         self.state.english_paths = paths
-        self.state.pairs = []
-        self.run_btn.configure(state=tk.DISABLED)
+        self._invalidate_split()
         self._update_ready_status()
 
     def _update_ready_status(self):
         n = len(self.state.nahuatl_paths)
         e = len(self.state.english_paths)
         if n and e:
-            self.status_var.set(
-                f"Ready — {n} Nahuatl + {e} English file(s). Click Split & Preview."
-            )
+            self.status_var.set(f"Ready — {n} Nahuatl + {e} English file(s). Click Split & Preview.")
         elif n or e:
             missing = "English" if n else "Nahuatl"
             self.status_var.set(f"Loaded {max(n, e)} file(s). Still need {missing} file(s).")
         else:
             self.status_var.set("Drop file(s) on both sides, then Split & Preview.")
 
-    def split_and_preview(self):
+    def _load_merged_texts(self) -> tuple[str, str] | None:
         if not self.state.nahuatl_paths or not self.state.english_paths:
-            messagebox.showinfo("Missing files", "Load at least one Nahuatl and one English file.")
-            return
-
+            return None
         try:
             nahuatl_text = read_text_files(self.state.nahuatl_paths)
             english_text = read_text_files(self.state.english_paths)
         except OSError as exc:
             messagebox.showerror("Read error", str(exc))
-            return
-
+            return None
         if not nahuatl_text.strip() or not english_text.strip():
             messagebox.showerror("Empty input", "One or both sides are empty after reading files.")
-            return
+            return None
+        if self.test_mode_var.get():
+            nahuatl_text, _, _ = truncate_words(nahuatl_text, TEST_MODE_WORD_LIMIT)
+            english_text, _, _ = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
+        return nahuatl_text, english_text
 
-        test_mode = self.test_mode_var.get()
-        self.state.test_mode = test_mode
-        trunc_note = ""
-        if test_mode:
-            nahuatl_text, nah_words, nah_cut = truncate_words(nahuatl_text, TEST_MODE_WORD_LIMIT)
-            english_text, eng_words, eng_cut = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
-            trunc_note = (
-                f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words "
-                f"(Nahuatl: {nah_words}{', truncated' if nah_cut else ''}; "
-                f"English: {eng_words}{', truncated' if eng_cut else ''})\n\n"
+    def _split_both(self, nahuatl_text: str, english_text: str) -> tuple[list[str], list[str]]:
+        method = self._split_method_key()
+        kwargs = {
+            "method": method,
+            "chapter_pattern": self.chapter_regex_var.get().strip() or DEFAULT_CHAPTER_REGEX,
+            "words_per_passage": self._words_per_passage(),
+        }
+        nahuatl_passages = split_passages(nahuatl_text, **kwargs)
+        english_passages = split_passages(english_text, **kwargs)
+        return nahuatl_passages, english_passages
+
+    def _check_large_passages(self, passages: list[str]) -> list[int]:
+        return [i for i, p in enumerate(passages, start=1) if count_words(p) > LARGE_PASSAGE_WORDS]
+
+    def _refresh_split_counts(self):
+        texts = self._load_merged_texts()
+        if not texts:
+            return
+        nahuatl_text, english_text = texts
+        self.state.nahuatl_text = nahuatl_text
+        self.state.english_text = english_text
+        try:
+            nah, eng = self._split_both(nahuatl_text, english_text)
+        except ValueError as exc:
+            self.split_count_var.set(f"Split error: {exc}")
+            return
+        large = sorted(set(self._check_large_passages(nah) + self._check_large_passages(eng)))
+        self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} | English {len(eng)}")
+        if large:
+            shown = large[:8]
+            extra = f" (+{len(large) - 8} more)" if len(large) > 8 else ""
+            self.large_passage_var.set(
+                f"Warning: passage(s) {shown}{extra} exceed {LARGE_PASSAGE_WORDS} words — may truncate."
+            )
+        else:
+            self.large_passage_var.set("")
+
+    def _update_alignment_label(self, nah_count: int, eng_count: int, *, aligned: bool):
+        if nah_count == 0 and eng_count == 0:
+            self.alignment_label.configure(
+                text="Alignment: run Split & Preview", fg="#666"
+            )
+            return
+        if aligned:
+            self.alignment_label.configure(
+                text=f"Nahuatl: {nah_count} passages | English: {eng_count} passages — ALIGNED",
+                fg="#15803d",
+            )
+        else:
+            self.alignment_label.configure(
+                text=f"Nahuatl: {nah_count} | English: {eng_count} — MISMATCH, do not run",
+                fg="#b91c1c",
             )
 
-        nahuatl_passages = split_passages(nahuatl_text)
-        english_passages = split_passages(english_text)
-
-        if not nahuatl_passages or not english_passages:
-            messagebox.showerror("Split error", "One or both sides produced no passages.")
-            return
-
-        if len(nahuatl_passages) != len(english_passages):
-            messagebox.showwarning(
-                "Count mismatch",
-                f"Nahuatl: {len(nahuatl_passages)} passages "
-                f"(from {format_file_list(self.state.nahuatl_paths)})\n"
-                f"English: {len(english_passages)} passages "
-                f"(from {format_file_list(self.state.english_paths)})\n\n"
-                "Files are merged in alphabetical order before splitting.\n"
-                "Check alignment before running. Preview shows the first pairs anyway.",
-            )
-
-        count = min(len(nahuatl_passages), len(english_passages))
-        self.state.pairs = list(zip(nahuatl_passages[:count], english_passages[:count]))
-
-        source_note = trunc_note + (
+    def _render_preview(self, pair_indices: list[int], pairs: list[tuple[str, str]] | None = None):
+        source_pairs = pairs if pairs is not None else self.state.pairs
+        lines: list[str] = []
+        if self.test_mode_var.get():
+            lines.append(f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words per side\n")
+        lines.append(
             f"Sources: Nahuatl [{format_file_list(self.state.nahuatl_paths)}] | "
-            f"English [{format_file_list(self.state.english_paths)}]\n\n"
+            f"English [{format_file_list(self.state.english_paths)}]\n"
         )
-        lines: list[str] = [source_note]
-        for i, (nah, eng) in enumerate(self.state.pairs[:PREVIEW_COUNT], start=1):
-            lines.append(f"=== Pair {i} ===")
-            lines.append("[NAHUATL]")
-            lines.append(nah[:800] + ("…" if len(nah) > 800 else ""))
-            lines.append("")
-            lines.append("[ENGLISH REF]")
-            lines.append(eng[:800] + ("…" if len(eng) > 800 else ""))
-            lines.append("")
-
+        lines.append(f"Split: {self.split_method_var.get()}\n")
+        for i in pair_indices:
+            if i < 1 or i > len(source_pairs):
+                lines.append(f"Pair {i}: out of range (1–{len(source_pairs)})\n")
+                continue
+            nah, eng = source_pairs[i - 1]
+            lines.extend(format_pair_preview(i, nah, eng))
         self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.delete("1.0", tk.END)
         self.preview_text.insert(tk.END, "\n".join(lines))
         self.preview_text.configure(state=tk.DISABLED)
 
-        self.run_btn.configure(state=tk.NORMAL if self.state.pairs else tk.DISABLED)
-        test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if test_mode else ""
-        self.status_var.set(
-            f"Split into {len(self.state.pairs)} pairs{test_label} from "
-            f"{len(self.state.nahuatl_paths)} + {len(self.state.english_paths)} file(s). "
-            "Review preview, then Run Translation."
+    def _show_preview_pair(self):
+        if not self.state.pairs:
+            messagebox.showinfo("No pairs", "Run Split & Preview first.")
+            return
+        try:
+            num = int(self.preview_pair_var.get().strip())
+        except ValueError:
+            messagebox.showwarning("Invalid number", "Enter a passage number.")
+            return
+        self._render_preview([num])
+
+    def split_and_preview(self):
+        if not self.state.nahuatl_paths or not self.state.english_paths:
+            messagebox.showinfo("Missing files", "Load at least one Nahuatl and one English file.")
+            return
+
+        texts = self._load_merged_texts()
+        if not texts:
+            return
+
+        nahuatl_text, english_text = texts
+        self.state.nahuatl_text = nahuatl_text
+        self.state.english_text = english_text
+        self.state.test_mode = self.test_mode_var.get()
+
+        try:
+            nahuatl_passages, english_passages = self._split_both(nahuatl_text, english_text)
+        except ValueError as exc:
+            messagebox.showerror("Split error", str(exc))
+            return
+
+        if not nahuatl_passages or not english_passages:
+            messagebox.showerror("Split error", "One or both sides produced no passages.")
+            return
+
+        self.state.nahuatl_passage_count = len(nahuatl_passages)
+        self.state.english_passage_count = len(english_passages)
+        aligned = len(nahuatl_passages) == len(english_passages)
+        self.state.aligned = aligned
+
+        self._update_alignment_label(len(nahuatl_passages), len(english_passages), aligned=aligned)
+        self.split_count_var.set(
+            f"Passage counts: Nahuatl {len(nahuatl_passages)} | English {len(english_passages)}"
         )
 
-    def run_translation(self):
+        large = sorted(
+            set(self._check_large_passages(nahuatl_passages) + self._check_large_passages(english_passages))
+        )
+        if large:
+            self.large_passage_var.set(
+                f"Warning: passage(s) {large[:8]} exceed {LARGE_PASSAGE_WORDS} words — may truncate."
+            )
+        else:
+            self.large_passage_var.set("")
+
+        if not aligned:
+            self.state.pairs = []
+            self.run_btn.configure(state=tk.DISABLED)
+            self.retry_btn.configure(state=tk.DISABLED)
+            preview_cap = min(PREVIEW_COUNT, len(nahuatl_passages), len(english_passages))
+            mismatch_pairs = list(
+                zip(nahuatl_passages[:preview_cap], english_passages[:preview_cap])
+            )
+            self._render_preview(list(range(1, preview_cap + 1)), pairs=mismatch_pairs)
+            messagebox.showerror(
+                "Alignment mismatch",
+                f"Nahuatl: {len(nahuatl_passages)} passages\n"
+                f"English: {len(english_passages)} passages\n\n"
+                "Counts must match exactly. Fix split settings or source files.\n"
+                "Run is blocked until aligned.",
+            )
+            return
+
+        self.state.pairs = list(zip(nahuatl_passages, english_passages))
+        preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
+        self._render_preview(preview_nums)
+
+        self.run_btn.configure(state=tk.NORMAL)
+        self.retry_btn.configure(state=tk.DISABLED)
+        test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
+        self.status_var.set(
+            f"Aligned — {len(self.state.pairs)} pairs{test_label}. Review preview, then Run Translation."
+        )
+
+    def retry_failed(self):
+        if self._running:
+            return
+        if not self.state.failed:
+            messagebox.showinfo("Nothing to retry", "No failed passages from the last run.")
+            return
+        if not self.state.pairs:
+            messagebox.showinfo("No pairs", "Run Split & Preview first.")
+            return
+        self.state.retry_indices = list(self.state.failed)
+        self.run_translation(retry_only=True)
+
+    def run_translation(self, *, retry_only: bool = False):
         if self._running:
             return
         if not self.state.pairs:
             messagebox.showinfo("Nothing to run", "Split & Preview first.")
+            return
+        if not retry_only and not self.state.aligned:
+            messagebox.showerror("Not aligned", "Passage counts must match before running.")
             return
 
         try:
@@ -824,50 +1227,80 @@ class TranslatorApp:
             return
 
         self._set_running_ui(True)
+        if not retry_only:
+            self.state.retry_indices = []
         self.state.total_input_tokens = 0
         self.state.total_output_tokens = 0
         self.state.total_cost = 0.0
-        self.state.results = []
-        self.state.failed = []
-        self.state.batch_ids = []
-        self.progress.configure(maximum=len(self.state.pairs), value=0)
+        self._progress_done = 0
+        self._progress_total = len(self._indices_to_run())
+        self.progress.configure(maximum=max(1, self._progress_total), value=0)
 
-        thread = threading.Thread(
-            target=self._translate_worker_batch if self.mode_var.get() == "batch" else self._translate_worker_live,
-            daemon=True,
-        )
+        worker = self._translate_worker_batch if self.mode_var.get() == "batch" else self._translate_worker_live
+        thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
     def _set_running_ui(self, running: bool) -> None:
         self._running = running
         state = tk.DISABLED if running else tk.NORMAL
         self.preview_btn.configure(state=state)
-        self.run_btn.configure(state=tk.DISABLED if running else (tk.NORMAL if self.state.pairs else tk.DISABLED))
+        can_run = bool(self.state.pairs and self.state.aligned and not running)
+        self.run_btn.configure(state=tk.NORMAL if can_run else tk.DISABLED)
+        can_retry = bool(self.state.failed and not running)
+        self.retry_btn.configure(state=tk.NORMAL if can_retry else tk.DISABLED)
         for rb in self._mode_radios:
             rb.configure(state=state)
         if self._test_mode_cb is not None:
             self._test_mode_cb.configure(state=state)
+        for w in self._split_widgets:
+            w.configure(state=state)
         cursor = "watch" if running else ""
         self.nahuatl_zone.configure(cursor=cursor)
         self.english_zone.configure(cursor=cursor)
 
-    def _finalize_passage_result(
-        self,
-        result: PassageResult,
-        *,
-        batch: bool,
-    ) -> None:
-        if result.error:
+    def _indices_to_run(self) -> list[int]:
+        if self.state.retry_indices:
+            return sorted(self.state.retry_indices)
+        return list(range(1, len(self.state.pairs) + 1))
+
+    def _try_load_existing(self, out_dir: Path, index: int) -> PassageResult | None:
+        existing = load_passage_record(passage_record_path(out_dir, index, self.state.test_mode))
+        if passage_is_resumable(existing):
+            existing.skipped = True
+            return existing
+        return None
+
+    def _finalize_passage_result(self, result: PassageResult, *, batch: bool) -> None:
+        if result.error or result.skipped:
             return
         self.state.total_input_tokens += result.input_tokens
         self.state.total_output_tokens += result.output_tokens
-        passage_cost = token_cost(result.input_tokens, result.output_tokens, batch=batch)
-        self.state.total_cost += passage_cost
-        print(
-            f"Passage {result.index}: in={result.input_tokens} out={result.output_tokens} "
-            f"cost=${passage_cost:.4f} running_total=${self.state.total_cost:.4f}"
-            + (" (batch rate)" if batch else "")
-        )
+        self.state.total_cost += token_cost(result.input_tokens, result.output_tokens, batch=batch)
+
+    def _handle_passage_done(
+        self,
+        out_dir: Path,
+        result: PassageResult,
+        *,
+        batch: bool,
+        results_by_index: dict[int, PassageResult],
+        failed: list[int],
+        truncated: list[int],
+        skipped: list[int],
+    ) -> None:
+        results_by_index[result.index] = result
+        if result.skipped:
+            skipped.append(result.index)
+        elif result.error:
+            failed.append(result.index)
+        elif result.truncated:
+            truncated.append(result.index)
+        if not result.skipped:
+            persist_passage_output(out_dir, result, self.state.test_mode)
+        if not result.skipped:
+            self._finalize_passage_result(result, batch=batch)
+        self._progress_done += 1
+        self.root.after(0, lambda r=result: self._update_progress(r, batch=batch))
 
     def _translate_worker_live(self):
         try:
@@ -878,32 +1311,46 @@ class TranslatorApp:
             self.root.after(0, lambda: self._on_run_error(str(exc)))
             return
 
-        results: list[PassageResult] = []
+        out_dir = output_directory(self.state.nahuatl_paths)
+        results_by_index: dict[int, PassageResult] = {}
         failed: list[int] = []
+        truncated: list[int] = []
+        skipped: list[int] = []
+        done_count = 0
 
-        for i, (nahuatl, english) in enumerate(self.state.pairs, start=1):
-            result = PassageResult(index=i)
-            try:
-                message = call_claude(
-                    client,
-                    system_prompt,
-                    build_user_message(nahuatl, english),
+        for index in self._indices_to_run():
+            nahuatl, english = self.state.pairs[index - 1]
+            existing = self._try_load_existing(out_dir, index)
+            if existing is not None:
+                self._handle_passage_done(
+                    out_dir, existing, batch=False,
+                    results_by_index=results_by_index, failed=failed,
+                    truncated=truncated, skipped=skipped,
                 )
-                response_text = message_text(message)
-                apply_parsed_response(result, response_text)
-                result.input_tokens = message.usage.input_tokens
-                result.output_tokens = message.usage.output_tokens
-                self._finalize_passage_result(result, batch=False)
+                done_count += 1
+                continue
+
+            result = PassageResult(index=index)
+            try:
+                message = call_claude(client, system_prompt, build_user_message(nahuatl, english))
+                apply_message_to_result(result, message)
             except Exception as exc:
                 result.error = str(exc)
-                failed.append(i)
-                print(f"Passage {i} FAILED: {exc}")
 
-            results.append(result)
-            done = i
-            self.root.after(0, lambda d=done, r=result: self._update_progress(d, r, batch=False))
+            self._handle_passage_done(
+                out_dir, result, batch=False,
+                results_by_index=results_by_index, failed=failed,
+                truncated=truncated, skipped=skipped,
+            )
+            done_count += 1
 
-        self.root.after(0, lambda: self._on_run_complete(results, failed, batch=False))
+        results = [results_by_index.get(i) or PassageResult(index=i, error="Not processed") for i in range(1, len(self.state.pairs) + 1)]
+        self.root.after(
+            0,
+            lambda: self._on_run_complete(
+                results, sorted(set(failed)), sorted(set(truncated)), sorted(set(skipped)), batch=False
+            ),
+        )
 
     def _translate_worker_batch(self):
         try:
@@ -914,139 +1361,122 @@ class TranslatorApp:
             self.root.after(0, lambda: self._on_run_error(str(exc)))
             return
 
-        pairs = self.state.pairs
-        total = len(pairs)
-        results_by_index: dict[int, PassageResult] = {
-            i: PassageResult(index=i) for i in range(1, total + 1)
-        }
+        out_dir = output_directory(self.state.nahuatl_paths)
+        results_by_index: dict[int, PassageResult] = {}
         failed: list[int] = []
+        truncated: list[int] = []
+        skipped: list[int] = []
         batch_ids: list[str] = []
+        pending: list[tuple[int, str, str]] = []
+
+        for index in self._indices_to_run():
+            existing = self._try_load_existing(out_dir, index)
+            if existing is not None:
+                self._handle_passage_done(
+                    out_dir, existing, batch=True,
+                    results_by_index=results_by_index, failed=failed,
+                    truncated=truncated, skipped=skipped,
+                )
+                continue
+            nahuatl, english = self.state.pairs[index - 1]
+            pending.append((index, nahuatl, english))
 
         try:
-            chunks: list[tuple[int, list[tuple[str, str]]]] = []
-            for offset in range(0, total, BATCH_MAX_REQUESTS):
-                start = offset + 1
-                chunk_pairs = pairs[offset : offset + BATCH_MAX_REQUESTS]
-                chunks.append((start, chunk_pairs))
-
-            for chunk_num, (start_index, chunk_pairs) in enumerate(chunks, start=1):
-                label = (
-                    f"Submitting batch {chunk_num}/{len(chunks)} "
-                    f"({len(chunk_pairs)} passages)…"
+            for offset in range(0, len(pending), BATCH_MAX_REQUESTS):
+                chunk = pending[offset : offset + BATCH_MAX_REQUESTS]
+                chunk_num = offset // BATCH_MAX_REQUESTS + 1
+                total_chunks = (len(pending) + BATCH_MAX_REQUESTS - 1) // BATCH_MAX_REQUESTS
+                self.root.after(
+                    0,
+                    lambda c=chunk_num, t=total_chunks, n=len(chunk): self.status_var.set(
+                        f"Submitting batch {c}/{t} ({n} passages)…"
+                    ),
                 )
-                self.root.after(0, lambda msg=label: self.status_var.set(msg))
-
-                batch_id = create_translation_batch(
-                    client, system_prompt, chunk_pairs, start_index=start_index
-                )
+                batch_id = create_translation_batch(client, system_prompt, chunk)
                 batch_ids.append(batch_id)
                 self.state.batch_ids = list(batch_ids)
-                out_dir = output_directory(self.state.nahuatl_paths)
                 names = output_filenames(test_mode=self.state.test_mode)
                 (out_dir / names["batch_state"]).write_text(
                     json.dumps({"batch_ids": batch_ids, "model": resolve_model()}, indent=2),
                     encoding="utf-8",
                 )
-                print(f"Batch submitted: {batch_id} ({len(chunk_pairs)} passages)")
 
-                def on_batch_status(batch_info: object, c=chunk_num, tc=len(chunks)):
+                def on_batch_status(batch_info: object, c=chunk_num, tc=total_chunks):
                     done, batch_total = batch_counts_done(batch_info)
                     if batch_total:
                         self.root.after(
                             0,
-                            lambda d=done, t=batch_total, cn=c, tcn=tc: (
-                                self.progress.configure(value=min(d, total), maximum=total),
-                                self.status_var.set(
-                                    f"Batch {cn}/{tcn} processing… {d}/{t} requests "
-                                    "(~50% off, usually under 1 hour)"
-                                ),
+                            lambda d=done, t=batch_total, cn=c, tcn=tc: self.status_var.set(
+                                f"Batch {cn}/{tcn} processing… {d}/{t} (~50% off)"
                             ),
                         )
 
                 wait_for_batch(client, batch_id, on_status=on_batch_status)
                 chunk_results = collect_batch_results(client, batch_id)
-
-                for idx in range(start_index, start_index + len(chunk_pairs)):
-                    result = chunk_results.get(idx) or PassageResult(
-                        index=idx, error="No result returned for this passage"
+                for index, _, _ in chunk:
+                    result = chunk_results.get(index) or PassageResult(
+                        index=index, error="No result returned for this passage"
                     )
-                    results_by_index[idx] = result
-                    if result.error:
-                        failed.append(idx)
-                        print(f"Passage {idx} FAILED: {result.error}")
-                    else:
-                        self._finalize_passage_result(result, batch=True)
-                    done = idx
-                    self.root.after(
-                        0,
-                        lambda d=done, r=result: self._update_progress(d, r, batch=True),
+                    self._handle_passage_done(
+                        out_dir, result, batch=True,
+                        results_by_index=results_by_index, failed=failed,
+                        truncated=truncated, skipped=skipped,
                     )
         except Exception as exc:
             self.root.after(0, lambda: self._on_run_error(str(exc)))
             return
 
-        results = [results_by_index[i] for i in range(1, total + 1)]
+        results = [results_by_index.get(i) or load_passage_record(passage_record_path(out_dir, i, self.state.test_mode)) or PassageResult(index=i, error="Not processed") for i in range(1, len(self.state.pairs) + 1)]
         self.root.after(
-            0, lambda: self._on_run_complete(results, sorted(set(failed)), batch=True)
+            0,
+            lambda: self._on_run_complete(
+                results, sorted(set(failed)), sorted(set(truncated)), sorted(set(skipped)), batch=True
+            ),
         )
 
-    def _update_progress(self, done: int, result: PassageResult, *, batch: bool):
-        self.progress.configure(value=done)
-        if result.error:
+    def _update_progress(self, result: PassageResult, *, batch: bool):
+        self.progress.configure(value=self._progress_done)
+        if result.skipped:
+            detail = f"Passage {result.index} skipped (already done)"
+        elif result.error:
             detail = f"Passage {result.index} failed"
+        elif result.truncated:
+            detail = f"Passage {result.index} TRUNCATED"
         else:
             detail = f"Passage {result.index}: {result.input_tokens}+{result.output_tokens} tok"
         mode = "batch ~50% off" if batch else "live"
         self.status_var.set(
-            f"{done}/{len(self.state.pairs)} done — ${self.state.total_cost:.4f} est. ({mode}) — {detail}"
+            f"{self._progress_done}/{self._progress_total} — ${self.state.total_cost:.4f} ({mode}) — {detail}"
         )
 
     def _on_run_error(self, msg: str):
         self._set_running_ui(False)
         messagebox.showerror("Translation error", msg)
 
-    def _on_run_complete(self, results: list[PassageResult], failed: list[int], *, batch: bool):
+    def _on_run_complete(
+        self,
+        results: list[PassageResult],
+        failed: list[int],
+        truncated: list[int],
+        skipped: list[int],
+        *,
+        batch: bool,
+    ):
         self._set_running_ui(False)
         self.state.results = results
         self.state.failed = failed
-
+        self.state.truncated = truncated
         out_dir = output_directory(self.state.nahuatl_paths)
-        names = output_filenames(test_mode=self.state.test_mode)
-
-        english_lines: list[str] = []
-        spanish_lines: list[str] = []
-        flag_blocks: list[str] = []
-
-        for r in results:
-            if r.error:
-                english_lines.append(f"[PASSAGE {r.index} — FAILED: {r.error}]")
-                spanish_lines.append(f"[PASSAGE {r.index} — FAILED: {r.error}]")
-            else:
-                english_lines.append(r.english)
-                spanish_lines.append(r.spanish)
-                if r.flags:
-                    flag_blocks.append(f"=== Passage {r.index} ===\n{r.flags}")
 
         try:
-            (out_dir / names["english"]).write_text(
-                "\n\n".join(english_lines) + "\n", encoding="utf-8"
-            )
-            (out_dir / names["spanish"]).write_text(
-                "\n\n".join(spanish_lines) + "\n", encoding="utf-8"
-            )
-            if flag_blocks:
-                (out_dir / names["flags"]).write_text(
-                    "\n\n".join(flag_blocks) + "\n", encoding="utf-8"
-                )
-            if failed:
-                fail_log = out_dir / names["failed_log"]
-                fail_lines = [f"Passage {i}: {results[i - 1].error}" for i in failed]
-                fail_log.write_text("\n".join(fail_lines) + "\n", encoding="utf-8")
+            rebuild_failed_log(out_dir, self.state.test_mode)
+            rebuild_truncated_log(out_dir, self.state.test_mode)
             write_run_summary(
                 out_dir,
                 mode="batch" if batch else "live",
                 results=results,
                 failed=failed,
+                truncated=truncated,
                 nahuatl_paths=self.state.nahuatl_paths,
                 english_paths=self.state.english_paths,
                 input_tokens=self.state.total_input_tokens,
@@ -1054,33 +1484,32 @@ class TranslatorApp:
                 cost=self.state.total_cost,
                 batch_ids=self.state.batch_ids if batch else None,
                 test_mode=self.state.test_mode,
+                skipped_count=len(skipped),
             )
+            names = output_filenames(test_mode=self.state.test_mode)
             batch_state = out_dir / names["batch_state"]
             if batch_state.is_file() and not failed:
                 batch_state.unlink()
         except OSError as exc:
             messagebox.showerror("Save error", str(exc))
-            self._set_running_ui(False)
             return
 
-        rate_note = " (batch rate, ~50% off)" if batch else ""
-        test_note = f"\nTest mode: first {TEST_MODE_WORD_LIMIT} words" if self.state.test_mode else ""
+        self.retry_btn.configure(state=tk.NORMAL if failed else tk.DISABLED)
+        ok = len(results) - len(failed) - len(truncated)
         summary = (
-            f"Done — {len(results) - len(failed)}/{len(results)} succeeded.\n"
+            f"Done — {ok}/{len(results)} complete.\n"
             f"Model: {resolve_model()}\n"
-            f"Mode: {'Batch (~50% off)' if batch else 'Live (full price)'}{test_note}\n"
-            f"Tokens: {self.state.total_input_tokens} in / {self.state.total_output_tokens} out\n"
-            f"Estimated cost: ${self.state.total_cost:.4f}{rate_note}\n"
-            f"Saved to {out_dir}\n"
-            f"(run_summary.json + run_summary.txt)"
+            f"Mode: {'Batch (~50% off)' if batch else 'Live'}\n"
+            f"Skipped (resume): {len(skipped)}\n"
+            f"Estimated cost: ${self.state.total_cost:.4f}\n"
+            f"Saved to {out_dir}"
         )
+        if truncated:
+            summary += f"\n\nTruncated (max_tokens): {truncated}\nSee truncated.log"
         if failed:
-            summary += f"\n\nFailed passages: {failed}\nSee failed_passages.log in output folder."
-            print(f"Failed passages: {failed}")
+            summary += f"\n\nFailed: {failed}\nUse Retry failed passages or see failed_passages.log"
 
-        self.status_var.set(
-            f"Complete — ${self.state.total_cost:.4f} — saved to {out_dir.name}"
-        )
+        self.status_var.set(f"Complete — ${self.state.total_cost:.4f} — {out_dir.name}")
         messagebox.showinfo("Translation complete", summary)
 
     def _on_close(self):
