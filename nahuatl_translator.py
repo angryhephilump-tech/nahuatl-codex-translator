@@ -24,7 +24,12 @@ import anthropic
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = SCRIPT_DIR / "wikowi_codex_prompt_FINAL.md"
 DEFAULT_MODEL = "claude-opus-4-8"
+ALIGNMENT_MODEL = os.environ.get("ALIGNMENT_MODEL", "claude-haiku-4-5")
 MAX_TOKENS = 4000
+ALIGNMENT_MAX_TOKENS = 2000
+ALIGNMENT_WINDOW_WORDS = 2500
+HAIKU_INPUT_COST_PER_M = 1.0
+HAIKU_OUTPUT_COST_PER_M = 5.0
 INPUT_COST_PER_M = 5.0
 OUTPUT_COST_PER_M = 25.0
 BATCH_DISCOUNT = 0.5
@@ -53,6 +58,16 @@ DEFAULT_CHAPTER_REGEX = (
     r")\s*$"
 )
 
+# Language-agnostic sentence endings (Latin, CJK full-width, ellipsis)
+SENTENCE_END_RE = re.compile(
+    r"(?<=[.!?…\u3002\uff01\uff1f])"
+    r'["\'\u00bb\u201d\u2019\)\]\u300d\ufeff]*'
+    r"(?:\s+|$)"
+)
+
+OPEN_QUOTES = frozenset('"\'«「“‘„')
+CLOSE_QUOTES = frozenset('"\'»」”’“')
+
 TAG_RE = {
     "english": re.compile(r"<english>(.*?)</english>", re.DOTALL | re.IGNORECASE),
     "spanish": re.compile(r"<spanish>(.*?)</spanish>", re.DOTALL | re.IGNORECASE),
@@ -71,20 +86,38 @@ class PassageResult:
     error: str | None = None
     truncated: bool = False
     skipped: bool = False
+    uncertain_match: bool = False
+
+
+@dataclass
+class AlignmentEntry:
+    index: int
+    nahuatl: str
+    english: str
+    uncertain: bool = False
 
 
 @dataclass
 class RunState:
     pairs: list[tuple[str, str]] = field(default_factory=list)
+    pair_uncertain: dict[int, bool] = field(default_factory=dict)
     nahuatl_paths: list[Path] = field(default_factory=list)
     english_paths: list[Path] = field(default_factory=list)
     nahuatl_text: str = ""
     english_text: str = ""
+    nahuatl_passages: list[str] = field(default_factory=list)
     nahuatl_passage_count: int = 0
     english_passage_count: int = 0
     aligned: bool = False
+    ai_alignment: bool = False
+    alignment_uncertain: list[int] = field(default_factory=list)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    alignment_input_tokens: int = 0
+    alignment_output_tokens: int = 0
+    alignment_cost: float = 0.0
     total_cost: float = 0.0
     results: list[PassageResult] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)
@@ -229,15 +262,93 @@ def split_by_paragraphs(text: str) -> list[str]:
     return [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
 
 
-def split_by_word_count(text: str, words_per_passage: int) -> list[str]:
+def quote_depth_at(text: str, pos: int) -> int:
+    depth = 0
+    i = 0
+    while i < min(pos, len(text)):
+        ch = text[i]
+        if ch in OPEN_QUOTES:
+            depth += 1
+        elif ch in CLOSE_QUOTES:
+            depth = max(0, depth - 1)
+        i += 1
+    return depth
+
+
+def extend_to_quote_close(text: str, pos: int) -> int:
+    """If pos falls inside quotes, extend through the closing quote."""
+    if quote_depth_at(text, pos) <= 0:
+        return min(pos, len(text))
+    depth = quote_depth_at(text, pos)
+    i = pos
+    while i < len(text) and depth > 0:
+        ch = text[i]
+        if ch in OPEN_QUOTES:
+            depth += 1
+        elif ch in CLOSE_QUOTES:
+            depth -= 1
+        i += 1
+    return i
+
+
+def find_natural_split_before(text: str, max_words: int) -> tuple[str, str]:
+    """Split text into head/tail at a natural boundary; head has at most max_words."""
     text = text.strip()
-    if not text:
-        return []
-    words = re.findall(r"\S+", text)
-    if not words:
-        return []
+    if count_words(text) <= max_words:
+        return text, ""
+    word_matches = list(re.finditer(r"\S+", text))
+    if len(word_matches) <= max_words:
+        return text, ""
+    target_end = word_matches[max_words - 1].end()
+    search_region = text[:target_end]
+    best_split: int | None = None
+    for match in SENTENCE_END_RE.finditer(search_region):
+        candidate = extend_to_quote_close(text, match.end())
+        if candidate > len(text) * 0.15:
+            best_split = candidate
+    if best_split is None:
+        best_split = extend_to_quote_close(text, target_end)
+    head = text[:best_split].strip()
+    tail = text[best_split:].strip()
+    if not head:
+        best_split = extend_to_quote_close(text, target_end)
+        head = text[:best_split].strip()
+        tail = text[best_split:].strip()
+    return head, tail
+
+
+def split_by_natural_word_chunks(text: str, words_per_passage: int) -> list[str]:
+    """Split on natural boundaries — never mid-sentence or mid-quote when avoidable."""
+    chunks: list[str] = []
+    remaining = text.strip()
     n = max(1, words_per_passage)
-    return [" ".join(words[i : i + n]) for i in range(0, len(words), n)]
+    while remaining:
+        if count_words(remaining) <= n:
+            chunks.append(remaining)
+            break
+        head, tail = find_natural_split_before(remaining, n)
+        if not head:
+            head, tail = find_natural_split_before(remaining, max(1, n // 2))
+        if head:
+            chunks.append(head)
+        remaining = tail
+        if not remaining:
+            break
+    return [c for c in chunks if c.strip()]
+
+
+def subdivide_large_chunks(chunks: list[str], max_words: int) -> list[str]:
+    out: list[str] = []
+    for chunk in chunks:
+        if count_words(chunk) <= max_words:
+            out.append(chunk)
+        else:
+            out.extend(split_by_natural_word_chunks(chunk, max_words))
+    return out
+
+
+def split_by_word_count(text: str, words_per_passage: int) -> list[str]:
+    return split_by_natural_word_chunks(text, words_per_passage)
 
 
 def split_passages(
@@ -253,12 +364,13 @@ def split_passages(
         except re.error as exc:
             raise ValueError(f"Invalid chapter regex: {exc}") from exc
         chunks = split_by_chapters(text, chapter_re)
-        if chunks:
-            return chunks
-        return split_by_paragraphs(text)
+        if not chunks:
+            chunks = split_by_paragraphs(text)
+        return subdivide_large_chunks(chunks, words_per_passage)
     if method == SPLIT_WORDS:
-        return split_by_word_count(text, words_per_passage)
-    return split_by_paragraphs(text)
+        return split_by_natural_word_chunks(text, words_per_passage)
+    chunks = split_by_paragraphs(text)
+    return subdivide_large_chunks(chunks, words_per_passage)
 
 
 def count_words(text: str) -> int:
@@ -298,6 +410,7 @@ def output_filenames(*, test_mode: bool) -> dict[str, str]:
         "truncated_log": f"truncated{suffix}.log",
         "batch_state": f"batch_state{suffix}.json",
         "passages_dir": f"passages{suffix}",
+        "alignment_map": f"alignment_map{suffix}.json",
     }
 
 
@@ -326,6 +439,7 @@ def load_passage_record(path: Path) -> PassageResult | None:
             error=data.get("error"),
             truncated=bool(data.get("truncated", False)),
             skipped=bool(data.get("skipped", False)),
+            uncertain_match=bool(data.get("uncertain_match", False)),
         )
     except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
         return None
@@ -362,7 +476,7 @@ def rebuild_aggregate_file(
         if rec.error:
             body = f"[FAILED: {rec.error}]"
         elif rec.truncated:
-            body = getattr(rec, field_name, "") + "\n[TRUNCATED — output hit max_tokens]"
+            body = "[TRUNCATED — output hit max_tokens; passage NOT complete — re-run or split]"
         else:
             body = getattr(rec, field_name, "")
         blocks.append(f"{marker}\n{body}")
@@ -421,9 +535,202 @@ def rebuild_truncated_log(out_dir: Path, test_mode: bool) -> None:
 
 def persist_passage_output(out_dir: Path, result: PassageResult, test_mode: bool) -> None:
     save_passage_record(out_dir, result, test_mode)
+    if result.truncated:
+        rebuild_truncated_log(out_dir, test_mode)
+        return
     rebuild_aggregate_file(out_dir, test_mode=test_mode, field_name="english", filename_key="english")
     rebuild_aggregate_file(out_dir, test_mode=test_mode, field_name="spanish", filename_key="spanish")
     rebuild_flags_file(out_dir, test_mode)
+
+
+def alignment_map_path(out_dir: Path, test_mode: bool) -> Path:
+    return out_dir / output_filenames(test_mode=test_mode)["alignment_map"]
+
+
+def split_settings_fingerprint(
+    method: str,
+    chapter_pattern: str,
+    words_per_passage: int,
+    test_mode: bool,
+    ai_alignment: bool,
+) -> dict:
+    return {
+        "method": method,
+        "chapter_pattern": chapter_pattern,
+        "words_per_passage": words_per_passage,
+        "test_mode": test_mode,
+        "ai_alignment": ai_alignment,
+    }
+
+
+def load_alignment_map(
+    path: Path,
+    *,
+    nahuatl_paths: list[Path],
+    english_paths: list[Path],
+    settings: dict,
+) -> list[AlignmentEntry] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if data.get("settings") != settings:
+        return None
+    if data.get("nahuatl_files") != [str(p) for p in nahuatl_paths]:
+        return None
+    if data.get("english_files") != [str(p) for p in english_paths]:
+        return None
+    entries: list[AlignmentEntry] = []
+    for item in data.get("pairs", []):
+        entries.append(
+            AlignmentEntry(
+                index=int(item["index"]),
+                nahuatl=item.get("nahuatl", ""),
+                english=item.get("english", ""),
+                uncertain=bool(item.get("uncertain", False)),
+            )
+        )
+    return entries or None
+
+
+def save_alignment_map(
+    path: Path,
+    entries: list[AlignmentEntry],
+    *,
+    nahuatl_paths: list[Path],
+    english_paths: list[Path],
+    settings: dict,
+) -> None:
+    payload = {
+        "settings": settings,
+        "nahuatl_files": [str(p) for p in nahuatl_paths],
+        "english_files": [str(p) for p in english_paths],
+        "pairs": [asdict(e) for e in entries],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def english_sliding_window(english_text: str, cursor: int, window_words: int = ALIGNMENT_WINDOW_WORDS) -> str:
+    remaining = english_text[cursor:].strip()
+    if not remaining:
+        return ""
+    window, _, _ = truncate_words(remaining, window_words)
+    return window
+
+
+def build_alignment_prompt(english_window: str, nahuatl_passage: str, index: int) -> str:
+    return (
+        "You align Nahuatl source passages to English reference text.\n\n"
+        f"ENGLISH REFERENCE (sequential window — copy verbatim from here only):\n"
+        f"{english_window}\n\n"
+        f"NAHUATL PASSAGE #{index}:\n{nahuatl_passage}\n\n"
+        "Return ONLY the exact substring from the English reference that matches this "
+        "Nahuatl passage in meaning. Do not paraphrase.\n\n"
+        "If there is no clear match, return exactly: NO_MATCH"
+    )
+
+
+def normalize_alignment_response(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```\w*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+    return cleaned
+
+
+def verify_english_substring(match: str, english_text: str, cursor: int) -> bool:
+    if not match or match.upper() == "NO_MATCH":
+        return False
+    pos = english_text.find(match, max(0, cursor - 200))
+    if pos < 0:
+        pos = english_text.find(match)
+    return pos >= 0
+
+
+def call_haiku_align(
+    client: anthropic.Anthropic,
+    english_window: str,
+    nahuatl_passage: str,
+    index: int,
+) -> tuple[str, bool, int, int]:
+    message = client.messages.create(
+        model=ALIGNMENT_MODEL,
+        max_tokens=ALIGNMENT_MAX_TOKENS,
+        messages=[
+            {"role": "user", "content": build_alignment_prompt(english_window, nahuatl_passage, index)},
+        ],
+    )
+    raw = normalize_alignment_response(message_text(message))
+    in_tok, out_tok = message_usage(message)
+    if raw.upper() == "NO_MATCH" or len(raw) < 8:
+        return raw, True, in_tok, out_tok
+    return raw, False, in_tok, out_tok
+
+
+def align_nahuatl_passages(
+    client: anthropic.Anthropic,
+    nahuatl_passages: list[str],
+    english_text: str,
+    *,
+    out_dir: Path,
+    test_mode: bool,
+    nahuatl_paths: list[Path],
+    english_paths: list[Path],
+    settings: dict,
+    on_progress: Callable[[int, int, str], None] | None = None,
+) -> tuple[list[AlignmentEntry], int, int]:
+    cache_path = alignment_map_path(out_dir, test_mode)
+    cached = load_alignment_map(
+        cache_path,
+        nahuatl_paths=nahuatl_paths,
+        english_paths=english_paths,
+        settings=settings,
+    )
+    if cached and len(cached) == len(nahuatl_passages):
+        return cached, 0, 0
+
+    entries: list[AlignmentEntry] = []
+    align_in = 0
+    align_out = 0
+    cursor = 0
+    total = len(nahuatl_passages)
+    for i, nahuatl in enumerate(nahuatl_passages, start=1):
+        if on_progress:
+            on_progress(i, total, f"AI aligning passage {i}/{total} (Haiku)…")
+        window = english_sliding_window(english_text, cursor)
+        english_match, uncertain, in_tok, out_tok = call_haiku_align(client, window, nahuatl, i)
+        align_in += in_tok
+        align_out += out_tok
+        if not uncertain and verify_english_substring(english_match, english_text, cursor):
+            pos = english_text.find(english_match, max(0, cursor - 200))
+            if pos < 0:
+                pos = english_text.find(english_match)
+            cursor = pos + len(english_match)
+        else:
+            uncertain = True
+            english_match = window[: min(len(window), 400)].strip() or "(no match found)"
+        entry = AlignmentEntry(index=i, nahuatl=nahuatl, english=english_match, uncertain=uncertain)
+        entries.append(entry)
+        save_alignment_map(
+            cache_path,
+            entries,
+            nahuatl_paths=nahuatl_paths,
+            english_paths=english_paths,
+            settings=settings,
+        )
+    return entries, align_in, align_out
+
+
+def cached_system_prompt(system_prompt: str) -> list[dict]:
+    return [
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
 
 
 def build_user_message(nahuatl: str, english: str) -> str:
@@ -447,10 +754,25 @@ def message_text(message: anthropic.types.Message | dict) -> str:
 
 
 def message_usage(message: anthropic.types.Message | dict) -> tuple[int, int]:
+    ext = message_usage_extended(message)
+    return ext["input_tokens"], ext["output_tokens"]
+
+
+def message_usage_extended(message: anthropic.types.Message | dict) -> dict[str, int]:
     usage = message.usage if hasattr(message, "usage") else message.get("usage", {})
     if isinstance(usage, dict):
-        return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
-    return int(getattr(usage, "input_tokens", 0)), int(getattr(usage, "output_tokens", 0))
+        return {
+            "input_tokens": int(usage.get("input_tokens", 0)),
+            "output_tokens": int(usage.get("output_tokens", 0)),
+            "cache_read_input_tokens": int(usage.get("cache_read_input_tokens", 0)),
+            "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens", 0)),
+        }
+    return {
+        "input_tokens": int(getattr(usage, "input_tokens", 0)),
+        "output_tokens": int(getattr(usage, "output_tokens", 0)),
+        "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0)),
+        "cache_creation_input_tokens": int(getattr(usage, "cache_creation_input_tokens", 0)),
+    }
 
 
 def message_stop_reason(message: anthropic.types.Message | dict) -> str | None:
@@ -476,6 +798,12 @@ def token_cost(input_tokens: int, output_tokens: int, *, batch: bool = False) ->
     )
 
 
+def haiku_token_cost(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens / 1_000_000 * HAIKU_INPUT_COST_PER_M) + (
+        output_tokens / 1_000_000 * HAIKU_OUTPUT_COST_PER_M
+    )
+
+
 def batch_custom_id(index: int) -> str:
     return f"passage-{index:05d}"
 
@@ -489,7 +817,7 @@ def build_message_params(system_prompt: str, nahuatl: str, english: str) -> dict
     return {
         "model": resolve_model(),
         "max_tokens": MAX_TOKENS,
-        "system": system_prompt,
+        "system": cached_system_prompt(system_prompt),
         "messages": [{"role": "user", "content": build_user_message(nahuatl, english)}],
     }
 
@@ -506,12 +834,18 @@ def apply_parsed_response(result: PassageResult, response_text: str) -> None:
 
 
 def apply_message_to_result(result: PassageResult, message: anthropic.types.Message | dict) -> None:
-    apply_parsed_response(result, message_text(message))
-    in_tok, out_tok = message_usage(message)
-    result.input_tokens = in_tok
-    result.output_tokens = out_tok
     if message_stop_reason(message) == "max_tokens":
         result.truncated = True
+    try:
+        apply_parsed_response(result, message_text(message))
+    except ValueError as exc:
+        if result.truncated:
+            result.error = f"Truncated response: {exc}"
+        else:
+            raise
+    usage = message_usage_extended(message)
+    result.input_tokens = usage["input_tokens"]
+    result.output_tokens = usage["output_tokens"]
 
 
 def create_translation_batch(
@@ -594,9 +928,17 @@ def collect_batch_results(client: anthropic.Anthropic, batch_id: str) -> dict[in
         if rtype == "succeeded":
             message = getattr(raw_result, "message", None) or raw_result.get("message")
             try:
-                apply_message_to_result(result, message)
+                if message_stop_reason(message) == "max_tokens":
+                    result.truncated = True
+                apply_parsed_response(result, message_text(message))
+                usage = message_usage_extended(message)
+                result.input_tokens = usage["input_tokens"]
+                result.output_tokens = usage["output_tokens"]
+                result._usage = usage  # type: ignore[attr-defined]
             except Exception as exc:
                 result.error = str(exc)
+                if message_stop_reason(message) == "max_tokens":
+                    result.truncated = True
         elif rtype == "errored":
             err = getattr(raw_result, "error", None) or raw_result.get("error", {})
             if isinstance(err, dict):
@@ -628,7 +970,7 @@ def call_claude(client: anthropic.Anthropic, system_prompt: str, user_message: s
             return client.messages.create(
                 model=resolve_model(),
                 max_tokens=MAX_TOKENS,
-                system=system_prompt,
+                system=cached_system_prompt(system_prompt),
                 messages=[{"role": "user", "content": user_message}],
             )
         except Exception as exc:
@@ -650,9 +992,16 @@ def format_file_list(paths: list[Path], max_names: int = 2) -> str:
     return f"{shown} (+{len(names) - max_names} more)"
 
 
-def format_pair_preview(index: int, nahuatl: str, english: str) -> list[str]:
+def format_pair_preview(
+    index: int,
+    nahuatl: str,
+    english: str,
+    *,
+    uncertain: bool = False,
+) -> list[str]:
+    flag = "  ⚠ UNCERTAIN MATCH — review manually" if uncertain else ""
     return [
-        f"=== Pair {index} ===",
+        f"=== Pair {index} ==={flag}",
         f"  Nahuatl : {first_words(nahuatl)}",
         f"  English : {first_words(english)}",
         "",
@@ -674,12 +1023,20 @@ def write_run_summary(
     batch_ids: list[str] | None = None,
     test_mode: bool = False,
     skipped_count: int = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    ai_alignment: bool = False,
+    alignment_input_tokens: int = 0,
+    alignment_output_tokens: int = 0,
+    alignment_cost: float = 0.0,
 ) -> None:
     model = resolve_model()
     names = output_filenames(test_mode=test_mode)
     stats = {
         "model": model,
+        "alignment_model": ALIGNMENT_MODEL if ai_alignment else None,
         "mode": mode,
+        "ai_alignment": ai_alignment,
         "test_mode": test_mode,
         "passages_total": len(results),
         "passages_succeeded": len([r for r in results if not r.error and not r.truncated]),
@@ -690,6 +1047,12 @@ def write_run_summary(
         "truncated_passage_numbers": truncated,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "alignment_input_tokens": alignment_input_tokens,
+        "alignment_output_tokens": alignment_output_tokens,
+        "alignment_cost_usd": round(alignment_cost, 4),
+        "translation_cost_usd": round(cost - alignment_cost, 4),
         "estimated_cost_usd": round(cost, 4),
         "batch_discount_applied": mode == "batch",
         "batch_ids": batch_ids or [],
@@ -700,12 +1063,20 @@ def write_run_summary(
     lines = [
         "Nahuatl Codex Translator — run summary",
         f"Model: {model}",
+        f"Alignment: {'AI (' + ALIGNMENT_MODEL + ')' if ai_alignment else 'Mechanical (positional)'}",
         f"Mode: {'Batch (~50% off)' if mode == 'batch' else 'Live (full price)'}",
         f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} OK",
         f"Skipped (resume): {skipped_count}",
         f"Tokens: {input_tokens} in / {output_tokens} out",
-        f"Estimated cost: ${cost:.4f}",
+        f"Prompt cache: {cache_read_tokens} read / {cache_creation_tokens} written",
     ]
+    if ai_alignment:
+        lines.append(f"Alignment tokens: {alignment_input_tokens} in / {alignment_output_tokens} out")
+        if alignment_cost:
+            lines.append(f"Alignment cost: ${alignment_cost:.4f}")
+    fresh_in = max(0, input_tokens - cache_read_tokens)
+    lines.append(f"Fresh input tokens (non-cache): {fresh_in}")
+    lines.append(f"Estimated cost: ${cost:.4f}")
     if truncated:
         lines.append(f"Truncated passages: {truncated}")
     if failed:
@@ -821,8 +1192,8 @@ class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
         self.root.title(f"Nahuatl Codex Translator — {resolve_model()}")
-        self.root.geometry("860x820")
-        self.root.minsize(760, 680)
+        self.root.geometry("860x860")
+        self.root.minsize(760, 720)
 
         self.state = RunState()
         self._running = False
@@ -830,6 +1201,7 @@ class TranslatorApp:
         self._progress_total = 0
         self._mode_radios: list[ttk.Radiobutton] = []
         self._split_widgets: list[tk.Widget] = []
+        self._ai_align_cb: ttk.Checkbutton | None = None
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -860,7 +1232,7 @@ class TranslatorApp:
         split_frame = ttk.LabelFrame(self.root, text="Split method")
         split_frame.pack(fill=tk.X, padx=10, pady=4)
 
-        self.split_method_var = tk.StringVar(value=SPLIT_CHAPTER)
+        self.split_method_var = tk.StringVar(value="Chapter headings")
         method_row = tk.Frame(split_frame)
         method_row.pack(fill=tk.X, padx=6, pady=4)
         ttk.Label(method_row, text="Method:").pack(side=tk.LEFT)
@@ -899,6 +1271,15 @@ class TranslatorApp:
         ttk.Label(split_frame, textvariable=self.large_passage_var, foreground="#b45309").pack(
             anchor=tk.W, padx=6, pady=(0, 4)
         )
+
+        self.ai_alignment_var = tk.BooleanVar(value=True)
+        self._ai_align_cb = ttk.Checkbutton(
+            split_frame,
+            text=f"AI-assisted alignment ({ALIGNMENT_MODEL}) — recommended",
+            variable=self.ai_alignment_var,
+            command=self._invalidate_split,
+        )
+        self._ai_align_cb.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
         btn_row = tk.Frame(self.root)
         btn_row.pack(fill=tk.X, **pad)
@@ -961,6 +1342,7 @@ class TranslatorApp:
             preview_frame, height=14, wrap=tk.WORD, font=("Consolas", 10)
         )
         self.preview_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.preview_text.tag_configure("uncertain", background="#fef9c3")
         self.preview_text.configure(state=tk.DISABLED)
 
         progress_frame = tk.Frame(self.root)
@@ -1038,16 +1420,24 @@ class TranslatorApp:
             english_text, _, _ = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
         return nahuatl_text, english_text
 
-    def _split_both(self, nahuatl_text: str, english_text: str) -> tuple[list[str], list[str]]:
-        method = self._split_method_key()
-        kwargs = {
-            "method": method,
+    def _split_kwargs(self) -> dict:
+        return {
+            "method": self._split_method_key(),
             "chapter_pattern": self.chapter_regex_var.get().strip() or DEFAULT_CHAPTER_REGEX,
             "words_per_passage": self._words_per_passage(),
         }
-        nahuatl_passages = split_passages(nahuatl_text, **kwargs)
-        english_passages = split_passages(english_text, **kwargs)
-        return nahuatl_passages, english_passages
+
+    def _alignment_settings(self) -> dict:
+        return split_settings_fingerprint(
+            self._split_kwargs()["method"],
+            self._split_kwargs()["chapter_pattern"],
+            self._split_kwargs()["words_per_passage"],
+            self.test_mode_var.get(),
+            self.ai_alignment_var.get(),
+        )
+
+    def _split_nahuatl_only(self, nahuatl_text: str) -> list[str]:
+        return split_passages(nahuatl_text, **self._split_kwargs())
 
     def _check_large_passages(self, passages: list[str]) -> list[int]:
         return [i for i, p in enumerate(passages, start=1) if count_words(p) > LARGE_PASSAGE_WORDS]
@@ -1060,12 +1450,16 @@ class TranslatorApp:
         self.state.nahuatl_text = nahuatl_text
         self.state.english_text = english_text
         try:
-            nah, eng = self._split_both(nahuatl_text, english_text)
+            nah = self._split_nahuatl_only(nahuatl_text)
+            eng = self._split_nahuatl_only(english_text) if not self.ai_alignment_var.get() else []
         except ValueError as exc:
             self.split_count_var.set(f"Split error: {exc}")
             return
+        if self.ai_alignment_var.get():
+            self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} (English split skipped — AI matching)")
+        else:
+            self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} | English {len(eng)}")
         large = sorted(set(self._check_large_passages(nah) + self._check_large_passages(eng)))
-        self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} | English {len(eng)}")
         if large:
             shown = large[:8]
             extra = f" (+{len(large) - 8} more)" if len(large) > 8 else ""
@@ -1075,11 +1469,32 @@ class TranslatorApp:
         else:
             self.large_passage_var.set("")
 
-    def _update_alignment_label(self, nah_count: int, eng_count: int, *, aligned: bool):
+    def _update_alignment_label(
+        self,
+        nah_count: int,
+        eng_count: int,
+        *,
+        aligned: bool,
+        ai_mode: bool = False,
+        uncertain_count: int = 0,
+    ):
         if nah_count == 0 and eng_count == 0:
-            self.alignment_label.configure(
-                text="Alignment: run Split & Preview", fg="#666"
-            )
+            self.alignment_label.configure(text="Alignment: run Split & Preview", fg="#666")
+            return
+        if ai_mode:
+            if uncertain_count:
+                self.alignment_label.configure(
+                    text=(
+                        f"Nahuatl: {nah_count} passages | AI-matched: {nah_count} — "
+                        f"{uncertain_count} UNCERTAIN (review before run)"
+                    ),
+                    fg="#b45309",
+                )
+            else:
+                self.alignment_label.configure(
+                    text=f"Nahuatl: {nah_count} passages | AI-matched: {nah_count} — ALIGNED",
+                    fg="#15803d",
+                )
             return
         if aligned:
             self.alignment_label.configure(
@@ -1102,15 +1517,26 @@ class TranslatorApp:
             f"English [{format_file_list(self.state.english_paths)}]\n"
         )
         lines.append(f"Split: {self.split_method_var.get()}\n")
+        if self.state.ai_alignment:
+            lines.append(f"Alignment: AI-assisted ({ALIGNMENT_MODEL})\n")
+        pair_blocks: list[tuple[list[str], bool]] = []
         for i in pair_indices:
             if i < 1 or i > len(source_pairs):
-                lines.append(f"Pair {i}: out of range (1–{len(source_pairs)})\n")
+                pair_blocks.append(([f"Pair {i}: out of range (1–{len(source_pairs)})", ""], False))
                 continue
             nah, eng = source_pairs[i - 1]
-            lines.extend(format_pair_preview(i, nah, eng))
+            uncertain = self.state.pair_uncertain.get(i, False)
+            pair_blocks.append((format_pair_preview(i, nah, eng, uncertain=uncertain), uncertain))
         self.preview_text.configure(state=tk.NORMAL)
         self.preview_text.delete("1.0", tk.END)
-        self.preview_text.insert(tk.END, "\n".join(lines))
+        if lines:
+            self.preview_text.insert(tk.END, "\n".join(lines))
+        for block_lines, uncertain in pair_blocks:
+            block_text = "\n".join(block_lines)
+            if uncertain:
+                self.preview_text.insert(tk.END, block_text, "uncertain")
+            else:
+                self.preview_text.insert(tk.END, block_text)
         self.preview_text.configure(state=tk.DISABLED)
 
     def _show_preview_pair(self):
@@ -1137,51 +1563,77 @@ class TranslatorApp:
         self.state.nahuatl_text = nahuatl_text
         self.state.english_text = english_text
         self.state.test_mode = self.test_mode_var.get()
+        self.state.ai_alignment = self.ai_alignment_var.get()
 
         try:
-            nahuatl_passages, english_passages = self._split_both(nahuatl_text, english_text)
+            nahuatl_passages = self._split_nahuatl_only(nahuatl_text)
         except ValueError as exc:
             messagebox.showerror("Split error", str(exc))
             return
 
-        if not nahuatl_passages or not english_passages:
-            messagebox.showerror("Split error", "One or both sides produced no passages.")
+        if not nahuatl_passages:
+            messagebox.showerror("Split error", "Nahuatl text produced no passages.")
             return
 
+        self.state.nahuatl_passages = nahuatl_passages
         self.state.nahuatl_passage_count = len(nahuatl_passages)
+        self._show_large_passage_warning(nahuatl_passages, [])
+
+        if self.state.ai_alignment:
+            self._set_running_ui(True)
+            self.status_var.set("Splitting Nahuatl… starting AI alignment (Haiku)…")
+            thread = threading.Thread(target=self._split_and_align_worker, daemon=True)
+            thread.start()
+            return
+
+        try:
+            english_passages = self._split_nahuatl_only(english_text)
+        except ValueError as exc:
+            messagebox.showerror("Split error", str(exc))
+            return
+        if not english_passages:
+            messagebox.showerror("Split error", "English text produced no passages.")
+            return
+        self._finish_mechanical_split(nahuatl_passages, english_passages)
+
+    def _show_large_passage_warning(self, nahuatl_passages: list[str], english_passages: list[str]):
+        large = sorted(
+            set(self._check_large_passages(nahuatl_passages) + self._check_large_passages(english_passages))
+        )
+        if large:
+            shown = large[:8]
+            extra = f" (+{len(large) - 8} more)" if len(large) > 8 else ""
+            self.large_passage_var.set(
+                f"Warning: passage(s) {shown}{extra} exceed {LARGE_PASSAGE_WORDS} words — may truncate."
+            )
+        else:
+            self.large_passage_var.set("")
+
+    def _finish_mechanical_split(self, nahuatl_passages: list[str], english_passages: list[str]):
         self.state.english_passage_count = len(english_passages)
         aligned = len(nahuatl_passages) == len(english_passages)
         self.state.aligned = aligned
+        self.state.pair_uncertain = {}
+        self.state.alignment_uncertain = []
 
         self._update_alignment_label(len(nahuatl_passages), len(english_passages), aligned=aligned)
         self.split_count_var.set(
             f"Passage counts: Nahuatl {len(nahuatl_passages)} | English {len(english_passages)}"
         )
-
-        large = sorted(
-            set(self._check_large_passages(nahuatl_passages) + self._check_large_passages(english_passages))
-        )
-        if large:
-            self.large_passage_var.set(
-                f"Warning: passage(s) {large[:8]} exceed {LARGE_PASSAGE_WORDS} words — may truncate."
-            )
-        else:
-            self.large_passage_var.set("")
+        self._show_large_passage_warning(nahuatl_passages, english_passages)
 
         if not aligned:
             self.state.pairs = []
             self.run_btn.configure(state=tk.DISABLED)
             self.retry_btn.configure(state=tk.DISABLED)
             preview_cap = min(PREVIEW_COUNT, len(nahuatl_passages), len(english_passages))
-            mismatch_pairs = list(
-                zip(nahuatl_passages[:preview_cap], english_passages[:preview_cap])
-            )
+            mismatch_pairs = list(zip(nahuatl_passages[:preview_cap], english_passages[:preview_cap]))
             self._render_preview(list(range(1, preview_cap + 1)), pairs=mismatch_pairs)
             messagebox.showerror(
                 "Alignment mismatch",
                 f"Nahuatl: {len(nahuatl_passages)} passages\n"
                 f"English: {len(english_passages)} passages\n\n"
-                "Counts must match exactly. Fix split settings or source files.\n"
+                "Counts must match exactly, or enable AI-assisted alignment.\n"
                 "Run is blocked until aligned.",
             )
             return
@@ -1189,13 +1641,90 @@ class TranslatorApp:
         self.state.pairs = list(zip(nahuatl_passages, english_passages))
         preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
         self._render_preview(preview_nums)
-
         self.run_btn.configure(state=tk.NORMAL)
         self.retry_btn.configure(state=tk.DISABLED)
         test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
         self.status_var.set(
             f"Aligned — {len(self.state.pairs)} pairs{test_label}. Review preview, then Run Translation."
         )
+
+    def _apply_alignment_entries(self, entries: list[AlignmentEntry]):
+        self.state.pairs = [(e.nahuatl, e.english) for e in entries]
+        self.state.pair_uncertain = {e.index: e.uncertain for e in entries}
+        self.state.alignment_uncertain = [e.index for e in entries if e.uncertain]
+        self.state.english_passage_count = len(entries)
+        self.state.aligned = True
+        uncertain = len(self.state.alignment_uncertain)
+        self._update_alignment_label(
+            len(entries),
+            len(entries),
+            aligned=True,
+            ai_mode=True,
+            uncertain_count=uncertain,
+        )
+        self.split_count_var.set(
+            f"Passage counts: Nahuatl {len(entries)} | AI-matched English: {len(entries)}"
+        )
+        preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
+        self._render_preview(preview_nums)
+        self.run_btn.configure(state=tk.NORMAL)
+        self.retry_btn.configure(state=tk.DISABLED)
+        test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
+        note = f" ({uncertain} uncertain)" if uncertain else ""
+        self.status_var.set(
+            f"AI-aligned — {len(self.state.pairs)} pairs{note}{test_label}. Review preview, then Run."
+        )
+        if uncertain:
+            messagebox.showwarning(
+                "Uncertain matches",
+                f"{uncertain} passage(s) had no clear English match (yellow in preview).\n"
+                "Review with Preview pair # before translating.",
+            )
+
+    def _split_and_align_worker(self):
+        try:
+            api_key = resolve_api_key()
+            client = anthropic.Anthropic(api_key=api_key)
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_align_error(str(exc)))
+            return
+
+        out_dir = output_directory(self.state.nahuatl_paths)
+        settings = self._alignment_settings()
+
+        def on_progress(done: int, total: int, msg: str):
+            self.root.after(0, lambda: self.status_var.set(msg))
+            self.root.after(0, lambda: self.progress.configure(maximum=total, value=done - 1))
+
+        try:
+            entries, align_in, align_out = align_nahuatl_passages(
+                client,
+                self.state.nahuatl_passages,
+                self.state.english_text,
+                out_dir=out_dir,
+                test_mode=self.state.test_mode,
+                nahuatl_paths=self.state.nahuatl_paths,
+                english_paths=self.state.english_paths,
+                settings=settings,
+                on_progress=on_progress,
+            )
+            if align_in == 0 and align_out == 0:
+                cache_path = alignment_map_path(out_dir, self.state.test_mode)
+                if cache_path.is_file():
+                    self.root.after(0, lambda: self.status_var.set("Loaded cached alignment_map.json"))
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_align_error(str(exc)))
+            return
+
+        self.state.alignment_input_tokens = align_in
+        self.state.alignment_output_tokens = align_out
+        self.state.alignment_cost = haiku_token_cost(align_in, align_out)
+        self.root.after(0, lambda: self._apply_alignment_entries(entries))
+        self.root.after(0, self._set_running_ui(False))
+
+    def _on_align_error(self, msg: str):
+        self._set_running_ui(False)
+        messagebox.showerror("Alignment error", msg)
 
     def retry_failed(self):
         if self._running:
@@ -1232,6 +1761,8 @@ class TranslatorApp:
         self.state.total_input_tokens = 0
         self.state.total_output_tokens = 0
         self.state.total_cost = 0.0
+        self.state.cache_read_tokens = 0
+        self.state.cache_creation_tokens = 0
         self._progress_done = 0
         self._progress_total = len(self._indices_to_run())
         self.progress.configure(maximum=max(1, self._progress_total), value=0)
@@ -1252,6 +1783,8 @@ class TranslatorApp:
             rb.configure(state=state)
         if self._test_mode_cb is not None:
             self._test_mode_cb.configure(state=state)
+        if self._ai_align_cb is not None:
+            self._ai_align_cb.configure(state=state)
         for w in self._split_widgets:
             w.configure(state=state)
         cursor = "watch" if running else ""
@@ -1270,9 +1803,18 @@ class TranslatorApp:
             return existing
         return None
 
-    def _finalize_passage_result(self, result: PassageResult, *, batch: bool) -> None:
+    def _finalize_passage_result(
+        self,
+        result: PassageResult,
+        *,
+        batch: bool,
+        usage: dict[str, int] | None = None,
+    ) -> None:
         if result.error or result.skipped:
             return
+        if usage:
+            self.state.cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+            self.state.cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
         self.state.total_input_tokens += result.input_tokens
         self.state.total_output_tokens += result.output_tokens
         self.state.total_cost += token_cost(result.input_tokens, result.output_tokens, batch=batch)
@@ -1298,7 +1840,8 @@ class TranslatorApp:
         if not result.skipped:
             persist_passage_output(out_dir, result, self.state.test_mode)
         if not result.skipped:
-            self._finalize_passage_result(result, batch=batch)
+            usage = getattr(result, "_usage", None)
+            self._finalize_passage_result(result, batch=batch, usage=usage)
         self._progress_done += 1
         self.root.after(0, lambda r=result: self._update_progress(r, batch=batch))
 
@@ -1334,6 +1877,7 @@ class TranslatorApp:
             try:
                 message = call_claude(client, system_prompt, build_user_message(nahuatl, english))
                 apply_message_to_result(result, message)
+                result._usage = message_usage_extended(message)  # type: ignore[attr-defined]
             except Exception as exc:
                 result.error = str(exc)
 
@@ -1481,10 +2025,16 @@ class TranslatorApp:
                 english_paths=self.state.english_paths,
                 input_tokens=self.state.total_input_tokens,
                 output_tokens=self.state.total_output_tokens,
-                cost=self.state.total_cost,
+                cost=self.state.total_cost + self.state.alignment_cost,
                 batch_ids=self.state.batch_ids if batch else None,
                 test_mode=self.state.test_mode,
                 skipped_count=len(skipped),
+                cache_read_tokens=self.state.cache_read_tokens,
+                cache_creation_tokens=self.state.cache_creation_tokens,
+                ai_alignment=self.state.ai_alignment,
+                alignment_input_tokens=self.state.alignment_input_tokens,
+                alignment_output_tokens=self.state.alignment_output_tokens,
+                alignment_cost=self.state.alignment_cost,
             )
             names = output_filenames(test_mode=self.state.test_mode)
             batch_state = out_dir / names["batch_state"]
@@ -1501,7 +2051,9 @@ class TranslatorApp:
             f"Model: {resolve_model()}\n"
             f"Mode: {'Batch (~50% off)' if batch else 'Live'}\n"
             f"Skipped (resume): {len(skipped)}\n"
-            f"Estimated cost: ${self.state.total_cost:.4f}\n"
+            f"Prompt cache: {self.state.cache_read_tokens} read / "
+            f"{self.state.cache_creation_tokens} written\n"
+            f"Estimated cost: ${self.state.total_cost + self.state.alignment_cost:.4f}\n"
             f"Saved to {out_dir}"
         )
         if truncated:

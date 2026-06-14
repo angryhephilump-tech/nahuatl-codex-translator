@@ -22,3 +22,5 @@ truncated.log
 truncated_test.log
 passages/
 passages_test/
+alignment_map.json
+alignment_map_test.json
