@@ -1200,6 +1200,16 @@ def call_claude(client: anthropic.Anthropic, system_prompt: str, user_message: s
     raise last_err or RuntimeError("API call failed")
 
 
+def format_uncertain_pairs(indices: list[int]) -> str:
+    if not indices:
+        return ""
+    if len(indices) == 1:
+        return f"Uncertain: pair #{indices[0]}"
+    shown = ", ".join(f"#{i}" for i in indices[:10])
+    extra = f" (+{len(indices) - 10} more)" if len(indices) > 10 else ""
+    return f"Uncertain: pairs {shown}{extra}"
+
+
 def format_file_list(paths: list[Path], max_names: int = 2) -> str:
     if not paths:
         return ""
@@ -1411,8 +1421,8 @@ class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
         self.root.title(f"Nahuatl Codex Translator — {TRANSLATION_MODEL}")
-        self.root.geometry("860x860")
-        self.root.minsize(760, 720)
+        self.root.geometry("920x920")
+        self.root.minsize(820, 640)
 
         self.state = RunState()
         self._running = False
@@ -1426,6 +1436,8 @@ class TranslatorApp:
         self._summary_alignment_cost = 0.0
         self._summary_alignment_input = 0
         self._summary_alignment_output = 0
+        self._split_busy = False
+        self._uncertain_nav_index = 0
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1445,8 +1457,18 @@ class TranslatorApp:
 
     def _build_translate_tab(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 4}
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
 
-        top = tk.Frame(parent)
+        paned = ttk.Panedwindow(parent, orient=tk.VERTICAL)
+        paned.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        controls = ttk.Frame(paned)
+        preview_frame = ttk.LabelFrame(paned, text="Alignment preview")
+        paned.add(controls, weight=1)
+        paned.add(preview_frame, weight=4)
+
+        top = tk.Frame(controls)
         top.pack(fill=tk.X, **pad)
 
         zones = tk.Frame(top)
@@ -1466,7 +1488,7 @@ class TranslatorApp:
         )
         self.english_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(5, 0))
 
-        split_frame = ttk.LabelFrame(parent, text="Split method")
+        split_frame = ttk.LabelFrame(controls, text="Split method")
         split_frame.pack(fill=tk.X, padx=10, pady=4)
 
         self.split_method_var = tk.StringVar(value="Chapter headings")
@@ -1494,6 +1516,7 @@ class TranslatorApp:
         self._split_widgets.append(regex_entry)
         detect_btn = ttk.Button(regex_row, text="Detect headings", command=self.detect_headings)
         detect_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._detect_btn = detect_btn
         self._split_widgets.append(detect_btn)
 
         front_row = tk.Frame(split_frame)
@@ -1549,7 +1572,7 @@ class TranslatorApp:
         )
         self._ai_align_cb.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
-        btn_row = tk.Frame(parent)
+        btn_row = tk.Frame(controls)
         btn_row.pack(fill=tk.X, **pad)
 
         self.preview_btn = ttk.Button(btn_row, text="Split && Preview", command=self.split_and_preview)
@@ -1589,7 +1612,7 @@ class TranslatorApp:
         self._test_mode_cb.pack(side=tk.LEFT, padx=6)
 
         self.alignment_label = tk.Label(
-            parent,
+            controls,
             text="Alignment: run Split & Preview",
             font=("Segoe UI", 11, "bold"),
             fg="#666",
@@ -1597,7 +1620,7 @@ class TranslatorApp:
         self.alignment_label.pack(anchor=tk.W, padx=12, pady=2)
 
         tk.Label(
-            parent,
+            controls,
             text=(
                 f"Alignment: {ALIGNMENT_MODEL}  ·  "
                 f"Translation: {resolve_translation_model()}  ·  max {MAX_TOKENS} tokens/passage"
@@ -1606,22 +1629,46 @@ class TranslatorApp:
             fg="#666",
         ).pack(anchor=tk.W, padx=12)
 
-        preview_frame = ttk.LabelFrame(parent, text="Alignment preview")
-        preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
-
         jump_row = tk.Frame(preview_frame)
         jump_row.pack(fill=tk.X, padx=6, pady=4)
         ttk.Label(jump_row, text="Preview pair #").pack(side=tk.LEFT)
         self.preview_pair_var = tk.StringVar(value="1")
         ttk.Entry(jump_row, textvariable=self.preview_pair_var, width=8).pack(side=tk.LEFT, padx=4)
-        ttk.Button(jump_row, text="Show", command=self._show_preview_pair).pack(side=tk.LEFT)
-
-        self.preview_text = scrolledtext.ScrolledText(
-            preview_frame, height=14, wrap=tk.WORD, font=("Consolas", 10)
+        ttk.Button(jump_row, text="Show", command=self._show_preview_pair).pack(side=tk.LEFT, padx=(0, 8))
+        self.next_uncertain_btn = ttk.Button(
+            jump_row,
+            text="Show next uncertain",
+            command=self._show_next_uncertain,
+            state=tk.DISABLED,
         )
-        self.preview_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.next_uncertain_btn.pack(side=tk.LEFT)
+
+        preview_body = tk.Frame(preview_frame)
+        preview_body.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        preview_body.columnconfigure(0, weight=1)
+        preview_body.rowconfigure(0, weight=1)
+
+        preview_scroll = ttk.Scrollbar(preview_body, orient=tk.VERTICAL)
+        preview_scroll.grid(row=0, column=1, sticky="ns")
+
+        self.preview_text = tk.Text(
+            preview_body,
+            wrap=tk.WORD,
+            font=("Consolas", 10),
+            yscrollcommand=preview_scroll.set,
+        )
+        self.preview_text.grid(row=0, column=0, sticky="nsew")
+        preview_scroll.config(command=self.preview_text.yview)
         self.preview_text.tag_configure("uncertain", background="#fef9c3")
         self.preview_text.configure(state=tk.DISABLED)
+
+        def _set_initial_sash():
+            try:
+                paned.sashpos(0, min(420, max(280, parent.winfo_height() // 3)))
+            except tk.TclError:
+                pass
+
+        parent.after(150, _set_initial_sash)
 
     def _build_prompt_tab(self, parent: ttk.Frame):
         header = tk.Frame(parent)
@@ -1774,12 +1821,102 @@ class TranslatorApp:
         self.state.alignment_uncertain = []
         self.state.pair_uncertain = {}
         self.state.split_suspicious = False
+        self._uncertain_nav_index = 0
         self.split_warning_var.set("")
         self.split_fallback_var.set("")
         self._refresh_run_buttons()
+        self._update_uncertain_ui()
         self._update_alignment_label(0, 0, aligned=False)
         if self.state.nahuatl_paths and self.state.english_paths:
             self._refresh_split_counts()
+
+    def _format_uncertain_status(self) -> str:
+        return format_uncertain_pairs(self.state.alignment_uncertain)
+
+    def _update_uncertain_ui(self) -> None:
+        if not hasattr(self, "next_uncertain_btn"):
+            return
+        enabled = bool(self.state.alignment_uncertain) and not self._split_busy and not self._running
+        self.next_uncertain_btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _set_split_busy(self, busy: bool, status: str = "") -> None:
+        self._split_busy = busy
+        if busy:
+            self.preview_btn.configure(state=tk.DISABLED)
+            if hasattr(self, "_detect_btn"):
+                self._detect_btn.configure(state=tk.DISABLED)
+            self.next_uncertain_btn.configure(state=tk.DISABLED)
+            for w in self._split_widgets:
+                w.configure(state=tk.DISABLED)
+            if status:
+                self.status_var.set(status)
+            try:
+                self.progress.stop()
+            except tk.TclError:
+                pass
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+            self.root.configure(cursor="watch")
+        else:
+            try:
+                self.progress.stop()
+            except tk.TclError:
+                pass
+            self.progress.configure(mode="determinate", maximum=1, value=0)
+            self.root.configure(cursor="")
+            if not self._running:
+                self.preview_btn.configure(state=tk.NORMAL)
+                if hasattr(self, "_detect_btn"):
+                    self._detect_btn.configure(state=tk.NORMAL)
+                for w in self._split_widgets:
+                    w.configure(state=tk.NORMAL)
+            self._update_uncertain_ui()
+            self._refresh_run_buttons()
+
+    def _set_align_progress(self, done: int, total: int, msg: str) -> None:
+        try:
+            self.progress.stop()
+        except tk.TclError:
+            pass
+        self.progress.configure(mode="determinate", maximum=max(1, total), value=max(0, done))
+        self.status_var.set(msg)
+
+    def _read_raw_texts_sync(
+        self,
+        nahuatl_paths: list[Path] | None = None,
+        english_paths: list[Path] | None = None,
+    ) -> tuple[str, str]:
+        nahuatl_paths = nahuatl_paths if nahuatl_paths is not None else self.state.nahuatl_paths
+        english_paths = english_paths if english_paths is not None else self.state.english_paths
+        if not nahuatl_paths or not english_paths:
+            raise ValueError("Load at least one Nahuatl and one English file.")
+        nahuatl_text = read_text_files(nahuatl_paths)
+        english_text = read_text_files(english_paths)
+        if not nahuatl_text.strip() or not english_text.strip():
+            raise ValueError("One or both sides are empty after reading files.")
+        return nahuatl_text, english_text
+
+    def _show_next_uncertain(self) -> None:
+        uncertain = self.state.alignment_uncertain
+        if not uncertain:
+            messagebox.showinfo("No uncertain pairs", "No uncertain alignment pairs to show.")
+            return
+        pair_num = uncertain[self._uncertain_nav_index % len(uncertain)]
+        self._uncertain_nav_index = (self._uncertain_nav_index + 1) % len(uncertain)
+        self.preview_pair_var.set(str(pair_num))
+        self._render_preview([pair_num])
+        self._scroll_preview_to_pair(pair_num)
+        self.status_var.set(
+            f"Showing uncertain pair #{pair_num}. {self._format_uncertain_status()}"
+        )
+
+    def _scroll_preview_to_pair(self, pair_num: int) -> None:
+        marker = f"=== Pair {pair_num} ==="
+        self.preview_text.see("1.0")
+        idx = self.preview_text.search(marker, "1.0", tk.END)
+        if idx:
+            self.preview_text.see(idx)
+            self.preview_text.mark_set(tk.INSERT, idx)
 
     def _refresh_run_buttons(self) -> None:
         needs_override = bool(self.state.alignment_uncertain or self.state.split_suspicious)
@@ -1845,6 +1982,25 @@ class TranslatorApp:
             english_text = strip_front_matter(english_text, pattern)
         return nahuatl_text, english_text
 
+    @staticmethod
+    def _prepare_texts_for_job(
+        nahuatl_text: str,
+        english_text: str,
+        *,
+        test_mode: bool,
+        skip_front_matter: bool,
+        chapter_pattern: str,
+    ) -> tuple[str, str]:
+        if test_mode:
+            nahuatl_text = text_after_first_heading(nahuatl_text, chapter_pattern)
+            english_text = text_after_first_heading(english_text, chapter_pattern)
+            nahuatl_text, _, _ = truncate_words(nahuatl_text, TEST_MODE_WORD_LIMIT)
+            english_text, _, _ = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
+        elif skip_front_matter:
+            nahuatl_text = strip_front_matter(nahuatl_text, chapter_pattern)
+            english_text = strip_front_matter(english_text, chapter_pattern)
+        return nahuatl_text, english_text
+
     def _load_merged_texts(self) -> tuple[str, str] | None:
         raw = self._read_raw_texts()
         if not raw:
@@ -1895,17 +2051,31 @@ class TranslatorApp:
             self.split_warning_var.set("")
 
     def detect_headings(self) -> None:
+        if self._split_busy or self._running:
+            return
         if not self.state.nahuatl_paths:
             messagebox.showinfo("No Nahuatl file", "Load a Nahuatl file first.")
             return
+        paths = list(self.state.nahuatl_paths)
+        self._set_split_busy(True, "Working… detecting headings…")
+        thread = threading.Thread(target=self._detect_headings_worker, args=(paths,), daemon=True)
+        thread.start()
+
+    def _detect_headings_worker(self, paths: list[Path]) -> None:
         try:
-            nahuatl_raw = read_text_files(self.state.nahuatl_paths)
+            nahuatl_raw = read_text_files(paths)
+            counts = count_heading_markers(nahuatl_raw)
+            report = format_heading_detection_report(counts)
+            best = best_heading_marker(counts)
+            self.root.after(0, lambda: self._show_detect_results(report, best))
         except OSError as exc:
-            messagebox.showerror("Read error", str(exc))
-            return
-        counts = count_heading_markers(nahuatl_raw)
-        report = format_heading_detection_report(counts)
-        best = best_heading_marker(counts)
+            self.root.after(0, lambda: messagebox.showerror("Read error", str(exc)))
+        except Exception as exc:
+            self.root.after(0, lambda: messagebox.showerror("Detect headings", str(exc)))
+        finally:
+            self.root.after(0, lambda: self._set_split_busy(False))
+
+    def _show_detect_results(self, report: str, best: tuple[str, int] | None) -> None:
         if best is None:
             messagebox.showinfo(
                 "Detect headings",
@@ -2044,36 +2214,120 @@ class TranslatorApp:
         self._render_preview([num])
 
     def split_and_preview(self):
+        if self._split_busy or self._running:
+            return
         if not self.state.nahuatl_paths or not self.state.english_paths:
             messagebox.showinfo("Missing files", "Load at least one Nahuatl and one English file.")
             return
+        job = {
+            "split_kwargs": self._split_kwargs(),
+            "test_mode": self.test_mode_var.get(),
+            "ai_alignment": self.ai_alignment_var.get(),
+            "skip_front_matter": self.skip_front_matter_var.get(),
+            "chapter_pattern": self._chapter_pattern(),
+            "alignment_settings": self._alignment_settings(),
+            "nahuatl_paths": list(self.state.nahuatl_paths),
+            "english_paths": list(self.state.english_paths),
+        }
+        self._set_split_busy(True, "Working… loading files and splitting…")
+        thread = threading.Thread(target=self._split_preview_worker, args=(job,), daemon=True)
+        thread.start()
 
-        texts = self._load_merged_texts()
-        if not texts:
-            return
-
-        nahuatl_text, english_text = texts
-        self.state.nahuatl_text = nahuatl_text
-        self.state.english_text = english_text
-        self.state.test_mode = self.test_mode_var.get()
-        self.state.ai_alignment = self.ai_alignment_var.get()
-
+    def _split_preview_worker(self, job: dict) -> None:
         try:
-            nahuatl_passages = self._split_nahuatl_only(nahuatl_text)
-        except ValueError as exc:
-            messagebox.showerror("Split error", str(exc))
-            return
+            nahuatl_text, english_text = self._read_raw_texts_sync(
+                job["nahuatl_paths"],
+                job["english_paths"],
+            )
+            nahuatl_text, english_text = self._prepare_texts_for_job(
+                nahuatl_text,
+                english_text,
+                test_mode=job["test_mode"],
+                skip_front_matter=job["skip_front_matter"],
+                chapter_pattern=job["chapter_pattern"],
+            )
+            split_kwargs = job["split_kwargs"]
+            nahuatl_passages = split_passages(nahuatl_text, **split_kwargs)
+            if not nahuatl_passages:
+                raise ValueError("Nahuatl text produced no passages.")
 
-        if not nahuatl_passages:
-            messagebox.showerror("Split error", "Nahuatl text produced no passages.")
-            return
+            result = {
+                "nahuatl_text": nahuatl_text,
+                "english_text": english_text,
+                "nahuatl_passages": nahuatl_passages,
+                "test_mode": job["test_mode"],
+                "ai_alignment": job["ai_alignment"],
+            }
 
-        self.state.nahuatl_passages = nahuatl_passages
-        self.state.nahuatl_passage_count = len(nahuatl_passages)
-        self._update_split_sanity(nahuatl_passages, nahuatl_text)
-        self._update_chapter_fallback_note(nahuatl_text)
-        self._show_large_passage_warning(nahuatl_passages, [])
+            if job["ai_alignment"]:
+                self.root.after(0, lambda: self.status_var.set("Working… AI alignment (Haiku)…"))
+                api_key = resolve_api_key()
+                client = anthropic.Anthropic(api_key=api_key)
+                out_dir = output_directory(job["nahuatl_paths"])
+                content_hash = source_content_hash(nahuatl_text, english_text)
 
+                def on_progress(done: int, total: int, msg: str) -> None:
+                    self.root.after(0, lambda d=done, t=total, m=msg: self._set_align_progress(d, t, m))
+
+                entries, align_in, align_out = align_nahuatl_passages(
+                    client,
+                    nahuatl_passages,
+                    english_text,
+                    out_dir=out_dir,
+                    test_mode=job["test_mode"],
+                    content_hash=content_hash,
+                    settings=job["alignment_settings"],
+                    on_progress=on_progress,
+                )
+                result["entries"] = entries
+                result["align_in"] = align_in
+                result["align_out"] = align_out
+                self.root.after(0, lambda r=result: self._complete_ai_split(r))
+            else:
+                self.root.after(0, lambda: self.status_var.set("Working… splitting English…"))
+                english_passages = split_passages(english_text, **split_kwargs)
+                if not english_passages:
+                    raise ValueError("English text produced no passages.")
+                result["english_passages"] = english_passages
+                self.root.after(0, lambda r=result: self._complete_mechanical_split(r))
+        except Exception as exc:
+            self.root.after(0, lambda e=str(exc): self._on_split_preview_error(e))
+        finally:
+            self.root.after(0, lambda: self._set_split_busy(False))
+
+    def _on_split_preview_error(self, msg: str) -> None:
+        messagebox.showerror("Split & Preview error", msg)
+
+    def _complete_ai_split(self, result: dict) -> None:
+        self.state.nahuatl_text = result["nahuatl_text"]
+        self.state.english_text = result["english_text"]
+        self.state.nahuatl_passages = result["nahuatl_passages"]
+        self.state.nahuatl_passage_count = len(result["nahuatl_passages"])
+        self.state.test_mode = result["test_mode"]
+        self.state.ai_alignment = result["ai_alignment"]
+        self._update_split_sanity(result["nahuatl_passages"], result["nahuatl_text"])
+        self._update_chapter_fallback_note(result["nahuatl_text"])
+        self._show_large_passage_warning(result["nahuatl_passages"], [])
+        if result.get("align_in", 0) == 0 and result.get("align_out", 0) == 0:
+            self.status_var.set("Loaded cached alignment_map.json")
+        self.state.alignment_input_tokens = result.get("align_in", 0)
+        self.state.alignment_output_tokens = result.get("align_out", 0)
+        self.state.alignment_cost = haiku_token_cost(
+            result.get("align_in", 0), result.get("align_out", 0)
+        )
+        self._apply_alignment_entries(result["entries"])
+        self._warn_split_issues()
+
+    def _complete_mechanical_split(self, result: dict) -> None:
+        self.state.nahuatl_text = result["nahuatl_text"]
+        self.state.english_text = result["english_text"]
+        self.state.test_mode = result["test_mode"]
+        self.state.ai_alignment = result["ai_alignment"]
+        self._update_chapter_fallback_note(result["nahuatl_text"])
+        self._finish_mechanical_split(result["nahuatl_passages"], result["english_passages"])
+        self._warn_split_issues()
+
+    def _warn_split_issues(self) -> None:
         if self.state.split_suspicious:
             messagebox.showwarning(
                 "Suspicious split",
@@ -2082,23 +2336,6 @@ class TranslatorApp:
                 "Your heading pattern probably didn't match. Try Detect headings or "
                 "Every N words.\n\nRun is blocked — use Run anyway only after reviewing preview.",
             )
-
-        if self.state.ai_alignment:
-            self._set_running_ui(True)
-            self.status_var.set("Splitting Nahuatl… starting AI alignment (Haiku)…")
-            thread = threading.Thread(target=self._split_and_align_worker, daemon=True)
-            thread.start()
-            return
-
-        try:
-            english_passages = self._split_nahuatl_only(english_text)
-        except ValueError as exc:
-            messagebox.showerror("Split error", str(exc))
-            return
-        if not english_passages:
-            messagebox.showerror("Split error", "English text produced no passages.")
-            return
-        self._finish_mechanical_split(nahuatl_passages, english_passages)
 
     def _show_large_passage_warning(self, nahuatl_passages: list[str], english_passages: list[str]):
         large = sorted(
@@ -2152,6 +2389,7 @@ class TranslatorApp:
         )
 
     def _apply_alignment_entries(self, entries: list[AlignmentEntry]):
+        self._uncertain_nav_index = 0
         self.state.pairs = [(e.nahuatl, e.english) for e in entries]
         self.state.pair_uncertain = {e.index: e.uncertain for e in entries}
         self.state.alignment_uncertain = [e.index for e in entries if e.uncertain]
@@ -2171,16 +2409,23 @@ class TranslatorApp:
         preview_nums = list(range(1, min(PREVIEW_COUNT, len(self.state.pairs)) + 1))
         self._render_preview(preview_nums)
         self._refresh_run_buttons()
+        self._update_uncertain_ui()
         test_label = f" [TEST ~{TEST_MODE_WORD_LIMIT} words]" if self.state.test_mode else ""
-        note = f" ({uncertain} uncertain)" if uncertain else ""
-        self.status_var.set(
-            f"AI-aligned — {len(self.state.pairs)} pairs{note}{test_label}. Review preview, then Run."
-        )
+        uncertain_note = self._format_uncertain_status()
+        if uncertain_note:
+            self.status_var.set(
+                f"AI-aligned — {len(self.state.pairs)} pairs{test_label}. {uncertain_note}"
+            )
+        else:
+            self.status_var.set(
+                f"AI-aligned — {len(self.state.pairs)} pairs{test_label}. Review preview, then Run."
+            )
         if uncertain:
             messagebox.showwarning(
                 "Uncertain matches",
                 f"{uncertain} passage(s) had no clear English match (yellow in preview).\n"
-                "Run Translation is blocked — use Run anyway after review, or re-split.",
+                f"{self._format_uncertain_status()}\n\n"
+                "Use Show next uncertain to review. Run is blocked — use Run anyway after review.",
             )
         if self.state.split_suspicious:
             messagebox.showwarning(
@@ -2189,51 +2434,6 @@ class TranslatorApp:
                 f"{self.state.split_suspicious_words:,} words.\n\n"
                 "Run is blocked — use Run anyway only after reviewing preview.",
             )
-
-    def _split_and_align_worker(self):
-        try:
-            api_key = resolve_api_key()
-            client = anthropic.Anthropic(api_key=api_key)
-        except Exception as exc:
-            self.root.after(0, lambda: self._on_align_error(str(exc)))
-            return
-
-        out_dir = output_directory(self.state.nahuatl_paths)
-        settings = self._alignment_settings()
-        content_hash = source_content_hash(self.state.nahuatl_text, self.state.english_text)
-
-        def on_progress(done: int, total: int, msg: str):
-            self.root.after(0, lambda: self.status_var.set(msg))
-            self.root.after(0, lambda: self.progress.configure(maximum=total, value=done - 1))
-
-        try:
-            entries, align_in, align_out = align_nahuatl_passages(
-                client,
-                self.state.nahuatl_passages,
-                self.state.english_text,
-                out_dir=out_dir,
-                test_mode=self.state.test_mode,
-                content_hash=content_hash,
-                settings=settings,
-                on_progress=on_progress,
-            )
-            if align_in == 0 and align_out == 0:
-                cache_path = alignment_map_path(out_dir, self.state.test_mode)
-                if cache_path.is_file():
-                    self.root.after(0, lambda: self.status_var.set("Loaded cached alignment_map.json"))
-        except Exception as exc:
-            self.root.after(0, lambda: self._on_align_error(str(exc)))
-            return
-
-        self.state.alignment_input_tokens = align_in
-        self.state.alignment_output_tokens = align_out
-        self.state.alignment_cost = haiku_token_cost(align_in, align_out)
-        self.root.after(0, lambda: self._apply_alignment_entries(entries))
-        self.root.after(0, self._set_running_ui(False))
-
-    def _on_align_error(self, msg: str):
-        self._set_running_ui(False)
-        messagebox.showerror("Alignment error", msg)
 
     def retry_failed(self):
         if self._running:
@@ -2313,8 +2513,16 @@ class TranslatorApp:
     def _set_running_ui(self, running: bool) -> None:
         self._running = running
         state = tk.DISABLED if running else tk.NORMAL
-        self.preview_btn.configure(state=state)
+        if running or self._split_busy:
+            self.preview_btn.configure(state=tk.DISABLED)
+            if hasattr(self, "_detect_btn"):
+                self._detect_btn.configure(state=tk.DISABLED)
+        elif not self._split_busy:
+            self.preview_btn.configure(state=tk.NORMAL)
+            if hasattr(self, "_detect_btn"):
+                self._detect_btn.configure(state=tk.NORMAL)
         self._refresh_run_buttons()
+        self._update_uncertain_ui()
         for rb in self._mode_radios:
             rb.configure(state=state)
         if self._test_mode_cb is not None:
@@ -2324,10 +2532,14 @@ class TranslatorApp:
         if getattr(self, "_skip_front_cb", None) is not None:
             self._skip_front_cb.configure(state=state)
         for w in self._split_widgets:
-            w.configure(state=state)
+            w.configure(state=state if not self._split_busy else tk.DISABLED)
         if running:
             self.run_anyway_btn.configure(state=tk.DISABLED)
         cursor = "watch" if running else ""
+        if not running and not self._split_busy:
+            self.root.configure(cursor="")
+        elif running:
+            self.root.configure(cursor="watch")
         self.nahuatl_zone.configure(cursor=cursor)
         self.english_zone.configure(cursor=cursor)
 
@@ -2616,10 +2828,10 @@ class TranslatorApp:
         messagebox.showinfo("Translation complete", summary)
 
     def _on_close(self):
-        if self._running:
+        if self._running or self._split_busy:
             if not messagebox.askokcancel(
-                "Translation running",
-                "A translation is still in progress. Quit anyway?",
+                "Work in progress",
+                "Split, alignment, or translation is still running. Quit anyway?",
             ):
                 return
         if self._prompt_is_dirty():
