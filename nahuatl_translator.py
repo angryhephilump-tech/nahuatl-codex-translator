@@ -40,6 +40,7 @@ PREVIEW_HEAD_WORDS = 10
 TEST_MODE_WORD_LIMIT = 300
 LARGE_PASSAGE_WORDS = 3000
 DEFAULT_WORDS_PER_PASSAGE = 400
+SPLIT_SANITY_WORDS_PER_PASSAGE = 2000
 API_MAX_RETRIES = 4
 BATCH_POLL_SEC = 15
 BATCH_MAX_REQUESTS = 5000
@@ -59,6 +60,35 @@ DEFAULT_CHAPTER_REGEX = (
     r"|\d+\.\s+[A-Z].+"
     r")\s*$"
 )
+
+# Scanned by "Detect headings" — (display label, line-matching regex)
+HEADING_DETECT_MARKERS: list[tuple[str, re.Pattern[str]]] = [
+    ("Capítulo", re.compile(r"(?mi)^Cap[ií]tulo\b")),
+    ("Chapter", re.compile(r"(?mi)^Chapter\b")),
+    ("Libro", re.compile(r"(?mi)^Libro\b")),
+    ("Book", re.compile(r"(?mi)^Book\b")),
+    ("Inic", re.compile(r"(?mi)^Inic\b")),
+    ("Ic", re.compile(r"(?mi)^Ic(?:[\.\s]|$)")),
+    ("amoxtli", re.compile(r"(?mi)^amoxtli\b")),
+    ("parrafo", re.compile(r"(?mi)^parrafo\b")),
+    ("Roman numeral", re.compile(r"(?m)^[IVXLCivxlc]+\.\s+\S")),
+    ("Numbered section", re.compile(r"(?m)^\d+\.\s+\S")),
+    ("Markdown heading", re.compile(r"(?m)^#{1,3}\s+\S")),
+]
+
+HEADING_MARKER_REGEX: dict[str, str] = {
+    "Capítulo": r"^Cap[ií]tulo\b.*$",
+    "Chapter": r"^Chapter\b.*$",
+    "Libro": r"^Libro\b.*$",
+    "Book": r"^Book\b.*$",
+    "Inic": r"^Inic\b.*$",
+    "Ic": r"^Ic(?:[\.\s]|$).*$",
+    "amoxtli": r"^amoxtli\b.*$",
+    "parrafo": r"^parrafo\b.*$",
+    "Roman numeral": r"^[IVXLCivxlc]+\.\s+\S.*$",
+    "Numbered section": r"^\d+\.\s+\S.*$",
+    "Markdown heading": r"^#{1,3}\s+\S.+$",
+}
 
 # Language-agnostic sentence endings (Latin, CJK full-width, ellipsis)
 SENTENCE_END_RE = re.compile(
@@ -128,6 +158,9 @@ class RunState:
     batch_ids: list[str] = field(default_factory=list)
     test_mode: bool = False
     retry_indices: list[int] = field(default_factory=list)
+    split_suspicious: bool = False
+    split_suspicious_words: int = 0
+    split_suspicious_count: int = 0
 
 
 def _read_env_key() -> str:
@@ -379,6 +412,65 @@ def split_by_word_count(text: str, words_per_passage: int) -> list[str]:
     return split_by_natural_word_chunks(text, words_per_passage)
 
 
+def chapter_heading_matches(text: str, chapter_pattern: str) -> list[re.Match[str]]:
+    try:
+        chapter_re = compile_chapter_regex(chapter_pattern)
+    except re.error:
+        return []
+    return list(chapter_re.finditer(text))
+
+
+def strip_front_matter(text: str, chapter_pattern: str) -> str:
+    """Discard everything before the first matched chapter heading."""
+    headings = chapter_heading_matches(text, chapter_pattern)
+    if not headings:
+        return text
+    return text[headings[0].start() :].lstrip()
+
+
+def text_after_first_heading(text: str, chapter_pattern: str) -> str:
+    return strip_front_matter(text, chapter_pattern)
+
+
+def minimum_expected_passages(word_count: int) -> int:
+    if word_count <= SPLIT_SANITY_WORDS_PER_PASSAGE:
+        return 1
+    return max(2, word_count // SPLIT_SANITY_WORDS_PER_PASSAGE)
+
+
+def split_sanity_is_suspicious(passage_count: int, word_count: int) -> bool:
+    return passage_count < minimum_expected_passages(word_count)
+
+
+def count_heading_markers(text: str) -> list[tuple[str, int]]:
+    counts: list[tuple[str, int]] = []
+    for label, pattern in HEADING_DETECT_MARKERS:
+        n = len(pattern.findall(text))
+        counts.append((label, n))
+    counts.sort(key=lambda item: item[1], reverse=True)
+    return counts
+
+
+def format_heading_detection_report(counts: list[tuple[str, int]]) -> str:
+    parts = [f"{n} '{label}'" for label, n in counts]
+    return "Found " + ", ".join(parts) + " headings."
+
+
+def best_heading_marker(counts: list[tuple[str, int]]) -> tuple[str, int] | None:
+    for label, n in counts:
+        if n > 0:
+            return label, n
+    return None
+
+
+def regex_for_heading_marker(label: str) -> str:
+    return HEADING_MARKER_REGEX.get(label, DEFAULT_CHAPTER_REGEX)
+
+
+def chapter_split_used_headings(text: str, chapter_pattern: str) -> bool:
+    return bool(chapter_heading_matches(text, chapter_pattern))
+
+
 def split_passages(
     text: str,
     method: str,
@@ -586,6 +678,7 @@ def split_settings_fingerprint(
     words_per_passage: int,
     test_mode: bool,
     ai_alignment: bool,
+    skip_front_matter: bool,
 ) -> dict:
     return {
         "method": method,
@@ -593,6 +686,7 @@ def split_settings_fingerprint(
         "words_per_passage": words_per_passage,
         "test_mode": test_mode,
         "ai_alignment": ai_alignment,
+        "skip_front_matter": skip_front_matter,
     }
 
 
@@ -1398,6 +1492,21 @@ class TranslatorApp:
         regex_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
         regex_entry.bind("<KeyRelease>", lambda _e: self._on_split_setting_changed())
         self._split_widgets.append(regex_entry)
+        detect_btn = ttk.Button(regex_row, text="Detect headings", command=self.detect_headings)
+        detect_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._split_widgets.append(detect_btn)
+
+        front_row = tk.Frame(split_frame)
+        front_row.pack(fill=tk.X, padx=6, pady=2)
+        self.skip_front_matter_var = tk.BooleanVar(value=True)
+        self._skip_front_cb = ttk.Checkbutton(
+            front_row,
+            text="Skip front matter before first heading (both sides)",
+            variable=self.skip_front_matter_var,
+            command=self._invalidate_split,
+        )
+        self._skip_front_cb.pack(anchor=tk.W)
+        self._split_widgets.append(self._skip_front_cb)
 
         words_row = tk.Frame(split_frame)
         words_row.pack(fill=tk.X, padx=6, pady=2)
@@ -1410,6 +1519,22 @@ class TranslatorApp:
 
         self.split_count_var = tk.StringVar(value="Passage counts: —")
         ttk.Label(split_frame, textvariable=self.split_count_var).pack(anchor=tk.W, padx=6, pady=2)
+        self.split_warning_var = tk.StringVar(value="")
+        tk.Label(
+            split_frame,
+            textvariable=self.split_warning_var,
+            fg="#b91c1c",
+            font=("Segoe UI", 9, "bold"),
+            wraplength=820,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=6, pady=2)
+        self.split_fallback_var = tk.StringVar(value="")
+        ttk.Label(
+            split_frame,
+            textvariable=self.split_fallback_var,
+            foreground="#b45309",
+            wraplength=820,
+        ).pack(anchor=tk.W, padx=6, pady=(0, 2))
         self.large_passage_var = tk.StringVar(value="")
         ttk.Label(split_frame, textvariable=self.large_passage_var, foreground="#b45309").pack(
             anchor=tk.W, padx=6, pady=(0, 4)
@@ -1436,7 +1561,7 @@ class TranslatorApp:
         self.run_anyway_btn = ttk.Button(
             btn_row,
             text="Run anyway",
-            command=lambda: self.run_translation(allow_uncertain=True),
+            command=lambda: self.run_translation(allow_override=True),
             state=tk.DISABLED,
         )
         self.run_anyway_btn.pack(side=tk.LEFT, padx=6)
@@ -1457,7 +1582,7 @@ class TranslatorApp:
         self.test_mode_var = tk.BooleanVar(value=False)
         self._test_mode_cb = ttk.Checkbutton(
             btn_row,
-            text=f"Test mode (first {TEST_MODE_WORD_LIMIT} words)",
+            text=f"Test mode (first {TEST_MODE_WORD_LIMIT} words after first heading)",
             variable=self.test_mode_var,
             command=self._invalidate_split,
         )
@@ -1640,20 +1765,26 @@ class TranslatorApp:
         except ValueError:
             return DEFAULT_WORDS_PER_PASSAGE
 
+    def _chapter_pattern(self) -> str:
+        return self.chapter_regex_var.get().strip() or DEFAULT_CHAPTER_REGEX
+
     def _invalidate_split(self):
         self.state.pairs = []
         self.state.aligned = False
         self.state.alignment_uncertain = []
         self.state.pair_uncertain = {}
+        self.state.split_suspicious = False
+        self.split_warning_var.set("")
+        self.split_fallback_var.set("")
         self._refresh_run_buttons()
         self._update_alignment_label(0, 0, aligned=False)
         if self.state.nahuatl_paths and self.state.english_paths:
             self._refresh_split_counts()
 
     def _refresh_run_buttons(self) -> None:
-        uncertain = bool(self.state.alignment_uncertain)
+        needs_override = bool(self.state.alignment_uncertain or self.state.split_suspicious)
         can_run = bool(self.state.pairs and self.state.aligned and not self._running)
-        if uncertain:
+        if needs_override:
             self.run_btn.configure(state=tk.DISABLED)
             self.run_anyway_btn.configure(state=tk.NORMAL if can_run else tk.DISABLED)
         else:
@@ -1688,7 +1819,7 @@ class TranslatorApp:
         else:
             self.status_var.set("Drop file(s) on both sides, then Split & Preview.")
 
-    def _load_merged_texts(self) -> tuple[str, str] | None:
+    def _read_raw_texts(self) -> tuple[str, str] | None:
         if not self.state.nahuatl_paths or not self.state.english_paths:
             return None
         try:
@@ -1700,15 +1831,30 @@ class TranslatorApp:
         if not nahuatl_text.strip() or not english_text.strip():
             messagebox.showerror("Empty input", "One or both sides are empty after reading files.")
             return None
+        return nahuatl_text, english_text
+
+    def _prepare_texts(self, nahuatl_text: str, english_text: str) -> tuple[str, str]:
+        pattern = self._chapter_pattern()
         if self.test_mode_var.get():
+            nahuatl_text = text_after_first_heading(nahuatl_text, pattern)
+            english_text = text_after_first_heading(english_text, pattern)
             nahuatl_text, _, _ = truncate_words(nahuatl_text, TEST_MODE_WORD_LIMIT)
             english_text, _, _ = truncate_words(english_text, TEST_MODE_WORD_LIMIT)
+        elif self.skip_front_matter_var.get():
+            nahuatl_text = strip_front_matter(nahuatl_text, pattern)
+            english_text = strip_front_matter(english_text, pattern)
         return nahuatl_text, english_text
+
+    def _load_merged_texts(self) -> tuple[str, str] | None:
+        raw = self._read_raw_texts()
+        if not raw:
+            return None
+        return self._prepare_texts(*raw)
 
     def _split_kwargs(self) -> dict:
         return {
             "method": self._split_method_key(),
-            "chapter_pattern": self.chapter_regex_var.get().strip() or DEFAULT_CHAPTER_REGEX,
+            "chapter_pattern": self._chapter_pattern(),
             "words_per_passage": self._words_per_passage(),
         }
 
@@ -1719,7 +1865,65 @@ class TranslatorApp:
             self._split_kwargs()["words_per_passage"],
             self.test_mode_var.get(),
             self.ai_alignment_var.get(),
+            self.skip_front_matter_var.get(),
         )
+
+    def _update_chapter_fallback_note(self, nahuatl_text: str) -> None:
+        if self._split_method_key() != SPLIT_CHAPTER:
+            self.split_fallback_var.set("")
+            return
+        if not chapter_split_used_headings(nahuatl_text, self._chapter_pattern()):
+            self.split_fallback_var.set(
+                "No chapter headings matched this regex — split fell back to paragraphs. "
+                "Try Detect headings, or switch to Every N words (approximate; AI alignment handles pairing)."
+            )
+        else:
+            self.split_fallback_var.set("")
+
+    def _update_split_sanity(self, passages: list[str], source_text: str) -> None:
+        wc = count_words(source_text)
+        n = len(passages)
+        self.state.split_suspicious = split_sanity_is_suspicious(n, wc)
+        self.state.split_suspicious_words = wc
+        self.state.split_suspicious_count = n
+        if self.state.split_suspicious:
+            self.split_warning_var.set(
+                f"Split produced only {n} passage(s) from {wc:,} words — your split pattern "
+                "probably didn't match this file's headings. Check the Split Preview before running."
+            )
+        else:
+            self.split_warning_var.set("")
+
+    def detect_headings(self) -> None:
+        if not self.state.nahuatl_paths:
+            messagebox.showinfo("No Nahuatl file", "Load a Nahuatl file first.")
+            return
+        try:
+            nahuatl_raw = read_text_files(self.state.nahuatl_paths)
+        except OSError as exc:
+            messagebox.showerror("Read error", str(exc))
+            return
+        counts = count_heading_markers(nahuatl_raw)
+        report = format_heading_detection_report(counts)
+        best = best_heading_marker(counts)
+        if best is None:
+            messagebox.showinfo(
+                "Detect headings",
+                f"{report}\n\n"
+                "No structural markers found. Switch to Every N words — splitting is approximate "
+                "but AI-assisted alignment will pair passages by meaning.",
+            )
+            return
+        label, n = best
+        suggested = regex_for_heading_marker(label)
+        if messagebox.askyesno(
+            "Detect headings",
+            f"{report}\n\n"
+            f"Most common: '{label}' ({n} hits).\n\n"
+            f"Fill the regex box with a pattern that matches '{label}' lines?",
+        ):
+            self.chapter_regex_var.set(suggested)
+            self._on_split_setting_changed()
 
     def _split_nahuatl_only(self, nahuatl_text: str) -> list[str]:
         return split_passages(nahuatl_text, **self._split_kwargs())
@@ -1744,6 +1948,8 @@ class TranslatorApp:
             self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} (English split skipped — AI matching)")
         else:
             self.split_count_var.set(f"Passage counts: Nahuatl {len(nah)} | English {len(eng)}")
+        self._update_split_sanity(nah, nahuatl_text)
+        self._update_chapter_fallback_note(nahuatl_text)
         large = sorted(set(self._check_large_passages(nah) + self._check_large_passages(eng)))
         if large:
             shown = large[:8]
@@ -1796,7 +2002,9 @@ class TranslatorApp:
         source_pairs = pairs if pairs is not None else self.state.pairs
         lines: list[str] = []
         if self.test_mode_var.get():
-            lines.append(f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words per side\n")
+            lines.append(
+                f"TEST MODE — first {TEST_MODE_WORD_LIMIT} words after first heading\n"
+            )
         lines.append(
             f"Sources: Nahuatl [{format_file_list(self.state.nahuatl_paths)}] | "
             f"English [{format_file_list(self.state.english_paths)}]\n"
@@ -1862,7 +2070,18 @@ class TranslatorApp:
 
         self.state.nahuatl_passages = nahuatl_passages
         self.state.nahuatl_passage_count = len(nahuatl_passages)
+        self._update_split_sanity(nahuatl_passages, nahuatl_text)
+        self._update_chapter_fallback_note(nahuatl_text)
         self._show_large_passage_warning(nahuatl_passages, [])
+
+        if self.state.split_suspicious:
+            messagebox.showwarning(
+                "Suspicious split",
+                f"Only {self.state.split_suspicious_count} passage(s) from "
+                f"{self.state.split_suspicious_words:,} words.\n\n"
+                "Your heading pattern probably didn't match. Try Detect headings or "
+                "Every N words.\n\nRun is blocked — use Run anyway only after reviewing preview.",
+            )
 
         if self.state.ai_alignment:
             self._set_running_ui(True)
@@ -1906,6 +2125,7 @@ class TranslatorApp:
             f"Passage counts: Nahuatl {len(nahuatl_passages)} | English {len(english_passages)}"
         )
         self._show_large_passage_warning(nahuatl_passages, english_passages)
+        self._update_split_sanity(nahuatl_passages, self.state.nahuatl_text)
 
         if not aligned:
             self.state.pairs = []
@@ -1961,6 +2181,13 @@ class TranslatorApp:
                 "Uncertain matches",
                 f"{uncertain} passage(s) had no clear English match (yellow in preview).\n"
                 "Run Translation is blocked — use Run anyway after review, or re-split.",
+            )
+        if self.state.split_suspicious:
+            messagebox.showwarning(
+                "Suspicious split",
+                f"Only {self.state.split_suspicious_count} passage(s) from "
+                f"{self.state.split_suspicious_words:,} words.\n\n"
+                "Run is blocked — use Run anyway only after reviewing preview.",
             )
 
     def _split_and_align_worker(self):
@@ -2020,7 +2247,7 @@ class TranslatorApp:
         self.state.retry_indices = list(self.state.failed)
         self.run_translation(retry_only=True)
 
-    def run_translation(self, *, retry_only: bool = False, allow_uncertain: bool = False):
+    def run_translation(self, *, retry_only: bool = False, allow_override: bool = False):
         if self._running:
             return
         if not self.state.pairs:
@@ -2029,13 +2256,22 @@ class TranslatorApp:
         if not retry_only and not self.state.aligned:
             messagebox.showerror("Not aligned", "Passage counts must match before running.")
             return
-        if not allow_uncertain and self.state.alignment_uncertain:
-            messagebox.showwarning(
-                "Uncertain alignment",
-                f"{len(self.state.alignment_uncertain)} passage(s) have uncertain English matches.\n"
-                "Review them in preview (yellow), then click Run anyway if you accept the risk.",
-            )
-            return
+        if not allow_override:
+            if self.state.split_suspicious:
+                messagebox.showwarning(
+                    "Suspicious split",
+                    f"Only {self.state.split_suspicious_count} passage(s) from "
+                    f"{self.state.split_suspicious_words:,} words.\n\n"
+                    "Fix your split pattern or click Run anyway after reviewing preview.",
+                )
+                return
+            if self.state.alignment_uncertain:
+                messagebox.showwarning(
+                    "Uncertain alignment",
+                    f"{len(self.state.alignment_uncertain)} passage(s) have uncertain English matches.\n"
+                    "Review them in preview (yellow), then click Run anyway if you accept the risk.",
+                )
+                return
         if not self._ensure_prompt_saved_for_run():
             return
 
@@ -2085,6 +2321,8 @@ class TranslatorApp:
             self._test_mode_cb.configure(state=state)
         if self._ai_align_cb is not None:
             self._ai_align_cb.configure(state=state)
+        if getattr(self, "_skip_front_cb", None) is not None:
+            self._skip_front_cb.configure(state=state)
         for w in self._split_widgets:
             w.configure(state=state)
         if running:
