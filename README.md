@@ -71,9 +71,11 @@ Test runs use `_test` suffixes.
 
 ## Models
 
-- **Translation:** `claude-opus-4-8` (override with `CLAUDE_MODEL`)
-- **AI alignment:** `claude-haiku-4-5` (override with `ALIGNMENT_MODEL`)
+- **Alignment:** `ALIGNMENT_MODEL` = `claude-haiku-4-5` (cheap span matching)
+- **Translation:** `TRANSLATION_MODEL` = `claude-opus-4-8` (override translation via `CLAUDE_MODEL` env var)
+
+Both appear in the run summary.
 
 ## System prompt
 
-Edit `wikowi_codex_prompt_FINAL.md` in this folder.
+Edit on the **Prompt** tab in the app, or edit `wikowi_codex_prompt_FINAL.md` directly. Use **Save** in the app to persist changes. Translation runs always use the saved file on disk.

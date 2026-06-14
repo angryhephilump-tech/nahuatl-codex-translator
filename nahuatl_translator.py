@@ -23,8 +23,8 @@ import anthropic
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPT_FILE = SCRIPT_DIR / "wikowi_codex_prompt_FINAL.md"
-DEFAULT_MODEL = "claude-opus-4-8"
-ALIGNMENT_MODEL = os.environ.get("ALIGNMENT_MODEL", "claude-haiku-4-5")
+ALIGNMENT_MODEL = "claude-haiku-4-5"
+TRANSLATION_MODEL = "claude-opus-4-8"
 MAX_TOKENS = 4000
 ALIGNMENT_MAX_TOKENS = 2000
 ALIGNMENT_WINDOW_WORDS = 2500
@@ -171,14 +171,23 @@ def resolve_api_key() -> str:
     )
 
 
+def resolve_translation_model() -> str:
+    return (os.environ.get("CLAUDE_MODEL") or TRANSLATION_MODEL).strip() or TRANSLATION_MODEL
+
+
 def resolve_model() -> str:
-    return (os.environ.get("CLAUDE_MODEL") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    """Alias for translation model (Opus)."""
+    return resolve_translation_model()
 
 
 def load_system_prompt() -> str:
     if not PROMPT_FILE.is_file():
         raise FileNotFoundError(f"System prompt not found: {PROMPT_FILE}")
-    return PROMPT_FILE.read_text(encoding="utf-8").strip()
+    return PROMPT_FILE.read_text(encoding="utf-8")
+
+
+def save_system_prompt(text: str) -> None:
+    PROMPT_FILE.write_text(text, encoding="utf-8")
 
 
 def parse_drop_paths(tk_root: tk.Misc, data: str) -> list[Path]:
@@ -815,7 +824,7 @@ def parse_passage_index(custom_id: str) -> int | None:
 
 def build_message_params(system_prompt: str, nahuatl: str, english: str) -> dict:
     return {
-        "model": resolve_model(),
+        "model": resolve_translation_model(),
         "max_tokens": MAX_TOKENS,
         "system": cached_system_prompt(system_prompt),
         "messages": [{"role": "user", "content": build_user_message(nahuatl, english)}],
@@ -968,7 +977,7 @@ def call_claude(client: anthropic.Anthropic, system_prompt: str, user_message: s
     for attempt in range(API_MAX_RETRIES):
         try:
             return client.messages.create(
-                model=resolve_model(),
+                model=resolve_translation_model(),
                 max_tokens=MAX_TOKENS,
                 system=cached_system_prompt(system_prompt),
                 messages=[{"role": "user", "content": user_message}],
@@ -1030,11 +1039,12 @@ def write_run_summary(
     alignment_output_tokens: int = 0,
     alignment_cost: float = 0.0,
 ) -> None:
-    model = resolve_model()
+    model = resolve_translation_model()
     names = output_filenames(test_mode=test_mode)
     stats = {
-        "model": model,
+        "translation_model": model,
         "alignment_model": ALIGNMENT_MODEL if ai_alignment else None,
+        "model": model,
         "mode": mode,
         "ai_alignment": ai_alignment,
         "test_mode": test_mode,
@@ -1062,8 +1072,8 @@ def write_run_summary(
     (out_dir / names["summary_json"]).write_text(json.dumps(stats, indent=2), encoding="utf-8")
     lines = [
         "Nahuatl Codex Translator — run summary",
-        f"Model: {model}",
-        f"Alignment: {'AI (' + ALIGNMENT_MODEL + ')' if ai_alignment else 'Mechanical (positional)'}",
+        f"Translation model: {model}",
+        f"Alignment model: {ALIGNMENT_MODEL if ai_alignment else 'n/a (mechanical pairing)'}",
         f"Mode: {'Batch (~50% off)' if mode == 'batch' else 'Live (full price)'}",
         f"Passages: {stats['passages_succeeded']}/{stats['passages_total']} OK",
         f"Skipped (resume): {skipped_count}",
@@ -1191,7 +1201,7 @@ class DropZone(tk.Frame):
 class TranslatorApp:
     def __init__(self):
         self.root = TkinterDnD.Tk()
-        self.root.title(f"Nahuatl Codex Translator — {resolve_model()}")
+        self.root.title(f"Nahuatl Codex Translator — {TRANSLATION_MODEL}")
         self.root.geometry("860x860")
         self.root.minsize(760, 720)
 
@@ -1202,14 +1212,29 @@ class TranslatorApp:
         self._mode_radios: list[ttk.Radiobutton] = []
         self._split_widgets: list[tk.Widget] = []
         self._ai_align_cb: ttk.Checkbutton | None = None
+        self._saved_prompt_text = ""
+        self._prompt_update_in_progress = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        translate_tab = ttk.Frame(self.notebook)
+        prompt_tab = ttk.Frame(self.notebook)
+        self.notebook.add(translate_tab, text="Translate")
+        self.notebook.add(prompt_tab, text="Prompt")
+
+        self._build_translate_tab(translate_tab)
+        self._build_progress_bar()
+        self._build_prompt_tab(prompt_tab)
+
+    def _build_translate_tab(self, parent: ttk.Frame):
         pad = {"padx": 10, "pady": 4}
 
-        top = tk.Frame(self.root)
+        top = tk.Frame(parent)
         top.pack(fill=tk.X, **pad)
 
         zones = tk.Frame(top)
@@ -1229,7 +1254,7 @@ class TranslatorApp:
         )
         self.english_zone.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=(5, 0))
 
-        split_frame = ttk.LabelFrame(self.root, text="Split method")
+        split_frame = ttk.LabelFrame(parent, text="Split method")
         split_frame.pack(fill=tk.X, padx=10, pady=4)
 
         self.split_method_var = tk.StringVar(value="Chapter headings")
@@ -1281,7 +1306,7 @@ class TranslatorApp:
         )
         self._ai_align_cb.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
-        btn_row = tk.Frame(self.root)
+        btn_row = tk.Frame(parent)
         btn_row.pack(fill=tk.X, **pad)
 
         self.preview_btn = ttk.Button(btn_row, text="Split && Preview", command=self.split_and_preview)
@@ -1313,22 +1338,24 @@ class TranslatorApp:
         self._test_mode_cb.pack(side=tk.LEFT, padx=6)
 
         self.alignment_label = tk.Label(
-            self.root,
+            parent,
             text="Alignment: run Split & Preview",
             font=("Segoe UI", 11, "bold"),
             fg="#666",
         )
         self.alignment_label.pack(anchor=tk.W, padx=12, pady=2)
 
-        model_label = tk.Label(
-            self.root,
-            text=f"Model: {resolve_model()}  ·  max {MAX_TOKENS} tokens/passage",
+        tk.Label(
+            parent,
+            text=(
+                f"Alignment: {ALIGNMENT_MODEL}  ·  "
+                f"Translation: {resolve_translation_model()}  ·  max {MAX_TOKENS} tokens/passage"
+            ),
             font=("Segoe UI", 9),
             fg="#666",
-        )
-        model_label.pack(anchor=tk.W, padx=12)
+        ).pack(anchor=tk.W, padx=12)
 
-        preview_frame = ttk.LabelFrame(self.root, text="Alignment preview")
+        preview_frame = ttk.LabelFrame(parent, text="Alignment preview")
         preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
         jump_row = tk.Frame(preview_frame)
@@ -1345,6 +1372,41 @@ class TranslatorApp:
         self.preview_text.tag_configure("uncertain", background="#fef9c3")
         self.preview_text.configure(state=tk.DISABLED)
 
+    def _build_prompt_tab(self, parent: ttk.Frame):
+        header = tk.Frame(parent)
+        header.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        ttk.Label(
+            header,
+            text=f"System prompt — saved to {PROMPT_FILE.name}",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side=tk.LEFT)
+
+        self.prompt_dirty_var = tk.StringVar(value="")
+        tk.Label(header, textvariable=self.prompt_dirty_var, fg="#b45309", font=("Segoe UI", 9)).pack(
+            side=tk.LEFT, padx=10
+        )
+
+        btn_row = tk.Frame(parent)
+        btn_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ttk.Button(btn_row, text="Save", command=self._save_prompt).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Reset to saved", command=self._reset_prompt).pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(
+            parent,
+            text="Translation runs use the saved file on disk. Save before running if you edit here.",
+            font=("Segoe UI", 9),
+            foreground="#666",
+        ).pack(anchor=tk.W, padx=10, pady=(0, 4))
+
+        self.prompt_text = scrolledtext.ScrolledText(parent, wrap=tk.WORD, font=("Consolas", 10))
+        self.prompt_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.prompt_text.bind("<KeyRelease>", self._on_prompt_edit)
+        self.prompt_text.bind("<<Paste>>", lambda _e: self.root.after(10, self._on_prompt_edit))
+        self._load_prompt_into_editor()
+
+    def _build_progress_bar(self):
+        pad = {"padx": 10, "pady": 4}
         progress_frame = tk.Frame(self.root)
         progress_frame.pack(fill=tk.X, **pad)
 
@@ -1353,6 +1415,82 @@ class TranslatorApp:
 
         self.status_var = tk.StringVar(value="Drop file(s) on both sides, then Split & Preview.")
         tk.Label(progress_frame, textvariable=self.status_var, anchor=tk.W, wraplength=820).pack(fill=tk.X)
+
+    def _prompt_editor_text(self) -> str:
+        return self.prompt_text.get("1.0", "end-1c")
+
+    def _prompt_is_dirty(self) -> bool:
+        return self._prompt_editor_text() != self._saved_prompt_text
+
+    def _update_prompt_dirty_indicator(self) -> None:
+        if self._prompt_is_dirty():
+            self.prompt_dirty_var.set("● Unsaved changes")
+            self.notebook.tab(1, text="Prompt *")
+        else:
+            self.prompt_dirty_var.set("")
+            self.notebook.tab(1, text="Prompt")
+
+    def _load_prompt_into_editor(self) -> None:
+        self._prompt_update_in_progress = True
+        try:
+            if PROMPT_FILE.is_file():
+                text = PROMPT_FILE.read_text(encoding="utf-8")
+            else:
+                text = ""
+            self._saved_prompt_text = text
+            self.prompt_text.delete("1.0", tk.END)
+            self.prompt_text.insert("1.0", text)
+        finally:
+            self._prompt_update_in_progress = False
+        self._update_prompt_dirty_indicator()
+
+    def _on_prompt_edit(self, _event=None) -> None:
+        if self._prompt_update_in_progress:
+            return
+        self._update_prompt_dirty_indicator()
+
+    def _save_prompt(self) -> bool:
+        text = self._prompt_editor_text()
+        if not text.strip():
+            messagebox.showerror("Empty prompt", "System prompt cannot be empty.")
+            return False
+        try:
+            save_system_prompt(text)
+        except OSError as exc:
+            messagebox.showerror("Save error", str(exc))
+            return False
+        self._saved_prompt_text = text
+        self._update_prompt_dirty_indicator()
+        self.status_var.set(f"Saved system prompt to {PROMPT_FILE.name}")
+        return True
+
+    def _reset_prompt(self) -> None:
+        if self._prompt_is_dirty():
+            if not messagebox.askyesno(
+                "Discard edits?",
+                "Reload the saved prompt from disk and discard unsaved edits?",
+            ):
+                return
+        self._load_prompt_into_editor()
+        self.status_var.set(f"Reloaded system prompt from {PROMPT_FILE.name}")
+
+    def _ensure_prompt_saved_for_run(self) -> bool:
+        if not self._prompt_is_dirty():
+            return True
+        answer = messagebox.askyesnocancel(
+            "Unsaved prompt",
+            "The system prompt has unsaved changes.\n\nSave to disk before running translation?",
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self._save_prompt()
+        messagebox.showinfo(
+            "Save required",
+            "Translation uses the saved prompt file.\n"
+            "Save your edits on the Prompt tab, or Reset to saved.",
+        )
+        return False
 
     def _split_method_key(self) -> str:
         label = self.split_method_var.get()
@@ -1747,6 +1885,8 @@ class TranslatorApp:
         if not retry_only and not self.state.aligned:
             messagebox.showerror("Not aligned", "Passage counts must match before running.")
             return
+        if not self._ensure_prompt_saved_for_run():
+            return
 
         try:
             resolve_api_key()
@@ -1941,7 +2081,7 @@ class TranslatorApp:
                 self.state.batch_ids = list(batch_ids)
                 names = output_filenames(test_mode=self.state.test_mode)
                 (out_dir / names["batch_state"]).write_text(
-                    json.dumps({"batch_ids": batch_ids, "model": resolve_model()}, indent=2),
+                    json.dumps({"batch_ids": batch_ids, "model": resolve_translation_model()}, indent=2),
                     encoding="utf-8",
                 )
 
@@ -2048,7 +2188,8 @@ class TranslatorApp:
         ok = len(results) - len(failed) - len(truncated)
         summary = (
             f"Done — {ok}/{len(results)} complete.\n"
-            f"Model: {resolve_model()}\n"
+            f"Alignment model: {ALIGNMENT_MODEL if self.state.ai_alignment else 'n/a (mechanical)'}\n"
+            f"Translation model: {resolve_translation_model()}\n"
             f"Mode: {'Batch (~50% off)' if batch else 'Live'}\n"
             f"Skipped (resume): {len(skipped)}\n"
             f"Prompt cache: {self.state.cache_read_tokens} read / "
@@ -2070,6 +2211,15 @@ class TranslatorApp:
                 "Translation running",
                 "A translation is still in progress. Quit anyway?",
             ):
+                return
+        if self._prompt_is_dirty():
+            answer = messagebox.askyesnocancel(
+                "Unsaved prompt",
+                "The system prompt has unsaved changes.\n\nSave before quitting?",
+            )
+            if answer is None:
+                return
+            if answer and not self._save_prompt():
                 return
         self.root.destroy()
 
